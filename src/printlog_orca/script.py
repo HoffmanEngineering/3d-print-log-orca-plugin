@@ -1,5 +1,6 @@
-"""The "Log last slice to 3D Print Log" script (Plugins > Run), for a Bambu send that no
-lifecycle event reported. Runs on the UI thread; the upload itself runs in the background."""
+"""The "Log last slice to 3D Print Log" script (Plugins > Run): logs the latest slice, for a
+send no event reported or a deliberate re-log. Runs on the UI thread; the upload itself runs on
+the plugin's background thread."""
 
 import logging
 
@@ -21,8 +22,8 @@ class LogLastSlice(orca.script.ScriptPluginCapabilityBase):
                     "Uploading the last slice to 3D Print Log; the browser opens when it is done."
                 )
             return orca.ExecutionResult.skipped(
-                "Nothing to log: slice a plate for a Bambu printer first. Exports and print-host "
-                "uploads are logged on their own."
+                "Nothing to log: slice a plate first. Print-host uploads and Bambu sends are "
+                "logged on their own; after an export, use the notification's link."
             )
         except Exception as error:
             _log.exception("Log last slice failed")

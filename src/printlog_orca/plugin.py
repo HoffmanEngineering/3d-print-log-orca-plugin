@@ -1,8 +1,16 @@
 """The OrcaSlicer side: the package class and the uploader capability.
 
-Orca calls execute() on the slicing worker thread, at every pipeline step of a process preset
-that lists this capability; only psGCodePostProcess matters here. Nothing in this file may
-raise into Orca, fail the slice, or call orca.host.ui (it can deadlock on that thread).
+Zero setup: once the plugin is enabled, Orca sends every lifecycle event to the uploader, for
+every printer and profile. The uploader watches four:
+- GCodeExportFinished (slicing thread): records the latest slice; a notification with a
+  "Log to 3D Print Log" link follows from the plugin's background thread.
+- UploadStarted (print-host queue thread): logs the latest slice.
+- PrintJobStarted / PrintStateChanged (device threads): Bambu sends.
+execute() is the optional psGCodePostProcess hook, for presets that list it: an export to file
+then uploads by itself.
+
+Nothing here may raise into Orca, fail the slice, start a thread, or call orca.host.ui: these
+callbacks run on Orca's own threads, inside an audit context (see background.py).
 """
 
 import logging
@@ -33,12 +41,37 @@ if not any(isinstance(h, _StderrHandler) for h in _log.handlers):
     _log.propagate = False
 
 
+def push_notification(text, hyper_text, on_click):
+    """Called only from the plugin's background thread, never from an Orca callback: the call
+    blocks until the UI thread shows it."""
+    ui = orca.host.ui
+    ui.push_notification(
+        ui.NotificationLevel.RegularNotificationLevel,
+        text,
+        hyper_text=hyper_text,
+        on_click=on_click,
+    )
+
+
 class PrintLogUploader(orca.slicing.SlicingPipelineCapabilityBase):
     def get_name(self):
         return "3D Print Log uploader"
 
     def get_default_config(self):
         return dict(controller.DEFAULT_CONFIG)
+
+    def on_load(self):
+        try:
+            controller.shared.set_notifier(push_notification)
+            controller.shared.set_active(True)
+        except Exception:
+            _log.exception("Could not start the 3D Print Log uploader")
+
+    def on_unload(self):
+        try:
+            controller.shared.set_active(False)
+        except Exception:
+            _log.exception("Could not stop the 3D Print Log uploader")
 
     def execute(self, ctx):
         if ctx.step != orca.slicing.Step.psGCodePostProcess:
@@ -65,13 +98,33 @@ class PrintLogUploader(orca.slicing.SlicingPipelineCapabilityBase):
         if name not in controller.WATCHED_EVENTS:
             return
         try:
-            controller.shared.on_event(
+            self._on_event(name, ctx)
+        except Exception:
+            _log.exception("Could not handle %s", name)
+
+    def _on_event(self, name, ctx):
+        shared = controller.shared
+        if name == controller.SLICE_EVENT:
+            # ctx.msg is the temp G-code path, or "path\n<error>" with an Error code.
+            if ctx.code != orca.LifecycleEvtCode.Ok:
+                return
+            shared.on_slice_finished(
+                storage_dir=orca.host.plugin.storage(),
+                settings=controller.parse_settings(self.get_config()),
+                gcode_path=ctx.msg,
+                model_name=ctx.name,
+            )
+        elif name == controller.UPLOAD_EVENT:
+            shared.on_upload_started(
+                settings=controller.parse_settings(self.get_config()), name=ctx.name
+            )
+        else:
+            shared.on_bambu_event(
                 settings=controller.parse_settings(self.get_config()),
                 event_name=name,
                 msg=ctx.msg,
+                name=ctx.name,
             )
-        except Exception:
-            _log.exception("Could not handle %s", name)
 
 
 @orca.plugin
@@ -79,3 +132,7 @@ class PrintLogPlugin(orca.base):
     def register_capabilities(self):
         orca.register_capability(PrintLogUploader)
         orca.register_capability(LogLastSlice)
+
+
+# Set at import too, in case Orca does not call on_load before the first event.
+controller.shared.set_notifier(push_notification)

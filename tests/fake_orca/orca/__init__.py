@@ -8,7 +8,10 @@ Python enums, which share `.name` and `==` with pybind11 enums.
 import enum
 import json
 
-from orca import _callback
+from orca import _audit, _callback
+
+# Orca installs its audit hook before any plugin code runs.
+_audit.install()
 
 
 class PluginType(enum.Enum):
@@ -203,6 +206,7 @@ __all__ = [
     "PluginResult",
     "PluginType",
     "PythonPluginBase",
+    "_audit",
     "_callback",
     "base",
     "host",

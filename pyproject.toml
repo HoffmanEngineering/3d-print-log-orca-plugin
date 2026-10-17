@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 [project]
 name = "3d-print-log-orca-plugin"
 dynamic = ["version"]
-description = "Sends each exported or sent OrcaSlicer print to 3D Print Log."
+description = "Sends each OrcaSlicer print you send or export to 3D Print Log."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

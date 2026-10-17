@@ -1,7 +1,6 @@
 import gzip
 import json
 import logging
-import threading
 from email import message_from_bytes
 from email.policy import HTTP
 from pathlib import Path
@@ -199,18 +198,47 @@ def test_debug_writes_the_metadata_and_the_response(gcode, tmp_path):
     assert record["url"].endswith(SETTING_ID)
 
 
-def test_start_runs_the_job_on_a_background_thread(gcode):
-    done = threading.Event()
-    threads = []
+def test_a_latest_slice_job_copies_the_temp_gcode_first_and_leaves_it(gcode, tmp_path):
+    temp = tmp_path / "orca-temp" / ".1234.0.gcode"
+    temp.parent.mkdir()
+    gcode.replace(temp)
+    copy = tmp_path / "storage" / "uploads" / "jobs" / "new.gcode"
 
-    def upload(*args, **kwargs):
-        threads.append(threading.current_thread())
-        done.set()
-        return UploadResult(False, 500, "server error")
+    api, _ = run(make_job(copy, source_path=temp))
 
-    thread = worker.start(make_job(gcode), upload=upload, open_url=lambda url: None)
-    thread.join(10)
+    assert api.sent()[0].startswith("; HEADER_BLOCK_START")
+    assert temp.exists(), "Orca's temp G-code is never moved or deleted"
+    assert not copy.exists()
 
-    assert done.is_set()
-    assert threads[0] is not threading.main_thread()
-    assert thread.daemon
+
+def test_a_slice_that_is_gone_is_logged_not_raised(tmp_path, caplog):
+    copy = tmp_path / "storage" / "uploads" / "jobs" / "new.gcode"
+
+    with caplog.at_level(logging.ERROR, logger="printlog_orca"):
+        api, _ = run(make_job(copy, source_path=tmp_path / "gone.gcode"))
+
+    assert api.calls == []
+    assert "slice again" in caplog.text.lower()
+
+
+def test_without_hook_values_the_gcode_supplies_them(gcode):
+    job = make_job(gcode, output_name="", orca_version="", preset_ids=None)
+
+    api, opened = run(job)
+
+    _, metadata = api.sent()
+    assert metadata["slicerVersion"] == "2.4.0"
+    assert metadata["outputName"] == "3DBenchy.gcode"
+    assert "cura_version=2.4.0" in opened[0]
+
+
+def test_without_hook_values_the_presets_come_from_the_gcode(gcode, tmp_path):
+    data_dir = tmp_path / "OrcaSlicer"
+    folder = data_dir / "user" / "42" / "process"
+    folder.mkdir(parents=True)
+    name = "0.10mm FAST DETAIL @MK4S 0.4 - 3DPrintLog"
+    (folder / f"{name}.json").write_text('{"name": "x"}', encoding="utf-8")
+
+    api, _ = run(make_job(gcode, data_dir=data_dir, preset_ids=None))
+
+    assert [p["name"] for p in api.sent()[1]["userPresets"]] == [name]

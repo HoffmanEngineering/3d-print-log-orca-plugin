@@ -1,19 +1,7 @@
-import threading
+import os
+import time
 
-import pytest
-
-from printlog_orca.staging import Staging
-
-
-class Clock:
-    def __init__(self, now=1_000.0):
-        self.now = now
-
-    def __call__(self):
-        return self.now
-
-
-IDS = {"print_settings_id": "P", "filament_settings_id": "F", "printer_settings_id": "M"}
+from printlog_orca import staging
 
 
 def source(tmp_path, text="; plate 1\n", name="plate_1.gcode"):
@@ -23,116 +11,47 @@ def source(tmp_path, text="; plate 1\n", name="plate_1.gcode"):
     return path
 
 
-def stage(staging, path, **overrides):
-    fields = {"host": "File", "output_name": str(path), "orca_version": "2.5.0", "preset_ids": IDS}
-    fields.update(overrides)
-    return staging.stage(path, **fields)
+def test_new_job_paths_are_distinct_and_create_nothing(tmp_path):
+    storage = tmp_path / "storage"
+
+    first, second = staging.new_job_path(storage), staging.new_job_path(storage)
+
+    assert first != second
+    assert first.parent == staging.jobs_dir(storage) == storage / "uploads" / "jobs"
+    assert not storage.exists()
 
 
-@pytest.fixture
-def storage(tmp_path):
-    return tmp_path / "storage"
-
-
-def test_stage_copies_the_gcode_and_remembers_the_slice(tmp_path, storage):
-    clock = Clock()
-    staging = Staging(storage, clock)
+def test_working_copy_copies_and_leaves_orcas_file(tmp_path):
+    storage = tmp_path / "storage"
     gcode = source(tmp_path)
 
-    stage(staging, gcode)
-    staged = staging.staged()
+    copy = staging.working_copy(storage, gcode)
 
-    assert staged.path.read_text() == "; plate 1\n"
-    assert staged.path.parent.parent == storage
-    assert (staged.host, staged.output_name, staged.orca_version) == ("File", str(gcode), "2.5.0")
-    assert staged.preset_ids == IDS
-    assert staged.staged_at == 1_000.0
+    assert copy.read_text() == "; plate 1\n"
+    assert copy.parent == staging.jobs_dir(storage)
     assert gcode.exists(), "Orca's own file is never moved or deleted"
 
 
-def test_a_new_slice_replaces_the_staged_one(tmp_path, storage):
-    clock = Clock()
-    staging = Staging(storage, clock)
-    stage(staging, source(tmp_path, "; first\n"))
-    clock.now = 2_000.0
-
-    stage(staging, source(tmp_path, "; second\n"))
-
-    assert staging.staged().path.read_text() == "; second\n"
-    assert staging.staged().staged_at == 2_000.0
-    assert len(list(storage.rglob("*.gcode"))) == 1
-
-
-def test_take_hands_over_the_slice_once(tmp_path, storage):
-    staging = Staging(storage, Clock())
-    stage(staging, source(tmp_path))
-
-    taken = staging.take()
-
-    assert taken.path.read_text() == "; plate 1\n"
-    assert staging.staged() is None
-    assert staging.take() is None
-
-
-def test_a_taken_file_survives_the_next_slice(tmp_path, storage):
-    staging = Staging(storage, Clock())
-    stage(staging, source(tmp_path, "; first\n"))
-    taken = staging.take()
-
-    stage(staging, source(tmp_path, "; second\n"))
-
-    assert taken.path.read_text() == "; first\n"
-
-
-def test_take_is_once_only_across_threads(tmp_path, storage):
-    staging = Staging(storage, Clock())
-    stage(staging, source(tmp_path))
-    results = []
-    threads = [threading.Thread(target=lambda: results.append(staging.take())) for _ in range(8)]
-
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert len([r for r in results if r is not None]) == 1
-
-
-def test_clear_drops_the_staged_slice_and_its_file(tmp_path, storage):
-    staging = Staging(storage, Clock())
-    staged = stage(staging, source(tmp_path))
-
-    staging.clear()
-
-    assert staging.staged() is None
-    assert not staged.path.exists()
-
-
-def test_working_copy_is_a_separate_file_per_call(tmp_path, storage):
-    staging = Staging(storage, Clock())
+def test_working_copy_is_a_separate_file_per_call(tmp_path):
+    storage = tmp_path / "storage"
     gcode = source(tmp_path)
 
-    first = staging.working_copy(gcode)
-    second = staging.working_copy(gcode)
-
-    assert first != second
-    assert first.read_text() == second.read_text() == "; plate 1\n"
+    assert staging.working_copy(storage, gcode) != staging.working_copy(storage, gcode)
 
 
-def test_leftovers_from_an_earlier_session_are_removed(tmp_path, storage):
-    Staging(storage, Clock()).working_copy(source(tmp_path))
-    stage(Staging(storage, Clock()), source(tmp_path))
+def test_remove_leftovers_keeps_copies_from_this_session(tmp_path):
+    storage = tmp_path / "storage"
+    old = staging.working_copy(storage, source(tmp_path))
+    an_hour_ago = time.time() - 3600
+    os.utime(old, (an_hour_ago, an_hour_ago))
+    new = staging.working_copy(storage, source(tmp_path))
 
-    Staging(storage, Clock())
+    removed = staging.remove_leftovers(storage, before=time.time() - 60)
 
-    assert list(storage.rglob("*.gcode")) == []
+    assert removed == 1
+    assert not old.exists()
+    assert new.exists()
 
 
-def test_a_failed_copy_leaves_the_previous_slice_staged(tmp_path, storage):
-    staging = Staging(storage, Clock())
-    stage(staging, source(tmp_path, "; first\n"))
-
-    with pytest.raises(OSError):
-        stage(staging, tmp_path / "missing.gcode")
-
-    assert staging.staged().path.read_text() == "; first\n"
+def test_remove_leftovers_without_a_folder(tmp_path):
+    assert staging.remove_leftovers(tmp_path / "nothing", before=time.time()) == 0
