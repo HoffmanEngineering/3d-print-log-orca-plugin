@@ -125,6 +125,8 @@ def _account_dirs(data_dir, log):
     user_dir = data_dir / "user"
     try:
         return [entry for entry in user_dir.iterdir() if entry.is_dir()]
+    except FileNotFoundError:
+        return []  # no user presets saved on this machine
     except OSError as error:
         log(f"No user presets: cannot list {user_dir}: {error}")
         return []

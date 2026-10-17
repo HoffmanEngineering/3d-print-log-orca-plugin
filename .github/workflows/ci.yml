@@ -41,8 +41,10 @@ jobs:
       - run: python -m build --wheel
       - name: Check the wheel is one OrcaSlicer can load
         run: python scripts/check_wheel.py dist/*.whl
+      # The file name releases use (see release.yml), so a test install matches a real one.
+      - run: mv dist/*.whl dist/3d-print-log.whl
       - uses: actions/upload-artifact@v4
         with:
           name: wheel
-          path: dist/*.whl
+          path: dist/3d-print-log.whl
           if-no-files-found: error
