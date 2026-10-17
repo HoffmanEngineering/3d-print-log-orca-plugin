@@ -8,6 +8,7 @@ import orca
 import orca_driver
 import pytest
 from orca import _audit
+from orca.host import app as host_app
 from orca.host import ui
 
 from printlog_orca import controller, staging
@@ -253,7 +254,7 @@ def test_the_script_logs_the_last_slice_on_the_ui_thread(env):
     result = orca_driver.run_script(capabilities[SCRIPT])
 
     assert result.status == orca.PluginResult.Success
-    assert "Open claim page" in result.message
+    assert "OrcaSlicer window" in result.message
     assert len(api) == 1
     install_id = json.loads((storage / "install.json").read_text())["installId"]
     assert f'"installId": "{install_id}"' in api[0]
@@ -281,3 +282,109 @@ def test_the_script_reports_a_declined_prompt(env, plugin_log):
     assert result.status == orca.PluginResult.RecoverableError
     assert "permission was declined" in result.message
     assert api == []
+
+
+# --- the plate's display name -------------------------------------------------------------
+
+
+def unnamed_slice(capabilities, temp):
+    # GCodeExportFinished carries an empty ctx.name for an STL project (2.5.0-alpha).
+    return sliced(capabilities, temp, model="")
+
+
+def test_an_unnamed_slice_is_named_for_the_saved_project(env):
+    capabilities, _, temp, ctl, _ = env
+    host_app.project_path = str(temp / "Projects" / "Desk organizer.3mf")
+    host_app.object_names[:] = ["cube.stl"]
+
+    unnamed_slice(capabilities, temp)
+
+    (note,) = ui.notifications
+    assert note.text == "Sliced Desk organizer. Open the 3D Print Log tab to log it."
+    assert listed(ctl)[0][0] == "Desk organizer"
+
+
+@pytest.mark.parametrize(
+    ("objects", "name"),
+    [
+        (["cube.stl"], "cube"),
+        (["cube.stl", "Benchy.3mf"], "cube and Benchy"),
+        (["cube.stl", "Benchy", "Bracket.STEP"], "cube and 2 more"),
+        (["", "  ", "Benchy"], "Benchy"),
+    ],
+)
+def test_an_unnamed_slice_of_an_unsaved_project_is_named_for_its_objects(env, objects, name):
+    capabilities, _, temp, ctl, _ = env
+    host_app.object_names[:] = objects
+
+    unnamed_slice(capabilities, temp)
+
+    assert ui.notifications[0].text == f"Sliced {name}. Open the 3D Print Log tab to log it."
+    assert listed(ctl)[0][0] == name
+
+
+def test_an_unnamed_slice_with_nothing_to_go_by_is_your_plate(env):
+    capabilities, _, temp, ctl, _ = env
+
+    unnamed_slice(capabilities, temp)
+
+    assert ui.notifications[0].text == "Sliced your plate. Open the 3D Print Log tab to log it."
+    assert listed(ctl)[0][0] == "Your plate"
+
+
+def test_the_events_own_name_wins(env):
+    capabilities, _, temp, ctl, _ = env
+    host_app.project_path = str(temp / "Desk organizer.3mf")
+
+    sliced(capabilities, temp, model="Benchy")
+
+    assert ui.notifications[0].text.startswith("Sliced Benchy.")
+    assert listed(ctl)[0][0] == "Benchy"
+
+
+def test_a_failing_host_falls_back_without_raising(env, monkeypatch):
+    capabilities, _, temp, ctl, _ = env
+
+    def broken():
+        raise RuntimeError("Plater is not available")
+
+    monkeypatch.setattr(orca.host, "plater", broken)
+    monkeypatch.setattr(orca.host, "model", broken)
+
+    unnamed_slice(capabilities, temp)
+
+    assert listed(ctl)[0][0] == "Your plate"
+
+
+def test_the_display_name_is_not_the_uploads_name(env):
+    capabilities, api, temp, _, _ = env
+    host_app.project_path = str(temp / "Desk organizer.3mf")
+    unnamed_slice(capabilities, temp)
+
+    orca_driver.run_script(capabilities[SCRIPT])
+
+    (body,) = api
+    assert "Desk organizer" not in body  # the uploader names it from the G-code's objects
+
+
+def test_the_display_name_is_read_with_no_io(env):
+    capabilities, _, temp, _, _ = env
+    host_app.project_path = str(temp / "Desk organizer.3mf")
+    host_app.object_names[:] = ["cube.stl"]
+
+    unnamed_slice(capabilities, temp)
+
+    assert _audit.audited == []
+    assert _audit.prompts == []
+
+
+def test_the_script_opens_the_claim_page_window(env):
+    capabilities, _, temp, _, _ = env
+    sliced(capabilities, temp)
+
+    result = orca_driver.run_script(capabilities[SCRIPT])
+
+    assert result.status == orca.PluginResult.Success
+    (window,) = ui.windows
+    assert window.open is True
+    assert "OrcaSlicer window" in result.message

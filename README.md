@@ -16,11 +16,11 @@ To update, install the new `3d-print-log.whl` the same way; it replaces the old 
 
 Nothing is uploaded until you ask. Slice as usual, then open the **3D Print Log** tab. It lists this session's latest slices (up to 10), newest first, with:
 
-- the model name and when you sliced it;
+- the model name (or, when OrcaSlicer gives none, the project's name or its objects') and when you sliced it;
 - where it went: **Not sent yet**, **Exported to** *file* (with the optional preset step below), **Sent to a print host** (OctoPrint, Moonraker, PrusaLink, Duet, ...), or **Sent to Bambu**;
 - whether it is **Not logged** or **Logged**.
 
-Click **Log to 3D Print Log** on a slice. The tab shows "Uploading…", OrcaSlicer may ask for permission (see below), and once the upload is done the tab opens the 3D Print Log claim page, where you sign in and save the print. To come back to the list, right-click the page and choose **Back** (or press Alt+Left on Windows). A logged slice keeps an **Open claim page** button; clicking Log on it again asks before uploading it a second time.
+Click **Log to 3D Print Log** on a slice. The tab shows "Uploading…", OrcaSlicer may ask for permission (see below), and once the upload is done the 3D Print Log claim page opens in an OrcaSlicer window, where you sign in and save the print. Close the window (or click **Back to OrcaSlicer** on the page) to come back; the tab stays on its list the whole time. A logged slice keeps an **Open claim page** button that opens the window again; clicking Log on it again asks before uploading it a second time.
 
 OrcaSlicer freezes for the few seconds the upload takes (plugins run on its main thread here); that is expected.
 
@@ -30,7 +30,7 @@ You can also log the latest slice from **Plugins**: select **Log last slice to 3
 
 ### Prefer your own browser?
 
-Click **Open in browser** in the tab. Your browser opens a 3D Print Log page that lists the prints this OrcaSlicer uploaded and is waiting for you to claim. It is the same page every time, so OrcaSlicer asks about opening it only once per install or update. Set `open_claim_page` to `"browser"` to open it after every log instead of the claim page in the tab. Use this if signing in inside OrcaSlicer does not work for you (Google sign-in may refuse to run inside an app).
+Click **Open in browser** in the tab. Your browser opens a 3D Print Log page that lists the prints this OrcaSlicer uploaded and is waiting for you to claim. It is the same page every time, so OrcaSlicer asks about opening it only once per install or update. Set `open_claim_page` to `"browser"` to open it after every log instead of the claim page window. Use this if signing in inside OrcaSlicer does not work for you (Google sign-in may refuse to run inside an app).
 
 ### Optional: log the exact exported file
 
@@ -58,7 +58,7 @@ The upload contains the start and end of the G-code (where the slicer writes its
 | Key | Default | Meaning |
 |---|---|---|
 | `template` | `"default"` | Note template: `default` (a curated list of settings) or `full` (most settings), as the uploader's `--default` / `--full`. |
-| `open_claim_page` | `"tab"` | After a log: `"tab"` opens the claim page in the 3D Print Log tab; `"browser"` opens your uploads page in your browser. |
+| `open_claim_page` | `"window"` | After a log: `"window"` opens the claim page in an OrcaSlicer window; `"browser"` opens your uploads page in your browser. `"tab"` (the 0.1.0 name) means `"window"`. |
 | `api_base` | `"https://api.3dprintlog.com"` | Where uploads go. |
 | `web_base` | `"https://www.3dprintlog.com"` | Where the claim and uploads pages are. |
 | `slice_notification` | `true` | Show the reminders after a slice and a Bambu send. |
@@ -78,8 +78,8 @@ The plugin writes to OrcaSlicer's Python log, lines starting with `[3D Print Log
 | The tab is empty | Slice a plate; slices from before the plugin was enabled, or from an earlier session, are not listed. |
 | "Orca blocked the upload because permission was declined" | You answered No to a prompt. Click Log again and answer Yes. |
 | "This slice is gone" | OrcaSlicer removed its temp file (the plate was re-sliced or the project closed). Slice again and log it. |
-| The tab shows the claim page and you want the list | Right-click the page and choose Back, or press Alt+Left. |
-| Can't sign in inside the tab | Use **Open in browser**, or set `open_claim_page` to `"browser"`. |
+| The claim page window is gone and the slice is not claimed yet | Click **Open claim page** on the slice in the tab. |
+| Can't sign in inside OrcaSlicer | Use **Open in browser**, or set `open_claim_page` to `"browser"`. |
 | `HTTP 429` | Too many uploads from your address in a short time; wait a minute. |
 | `HTTP 413` | The G-code's settings or thumbnails are unusually large. |
 | The browser does not open | You answered No to the prompt, or no default browser is set. Click Open in browser again. |
@@ -98,7 +98,7 @@ python -m venv .venv
 .venv/Scripts/python -m build --wheel && .venv/Scripts/python scripts/check_wheel.py dist/*.whl
 ```
 
-Tests run against a fake `orca` module (`tests/fake_orca/`) that follows the 2.5 bindings and Orca's threading and audit rules: events arrive in the callback context of the Orca thread that raises them; inside a UI-thread callback a file outside the allowed folders, the network or a process launch "prompts" (Yes by default, `PermissionError` when a test answers No); off the UI thread they are denied; and any plugin I/O outside an audit context (a thread the plugin started, import) fails the test. `orca_driver.Page` plays the tab. Only `plugin.py`, `page.py` and `script.py` import `orca`.
+Tests run against a fake `orca` module (`tests/fake_orca/`) that follows the 2.5 bindings and Orca's threading and audit rules: events arrive in the callback context of the Orca thread that raises them; inside a UI-thread callback a file outside the allowed folders, the network or a process launch "prompts" (Yes by default, `PermissionError` when a test answers No); off the UI thread they are denied; and any plugin I/O outside an audit context (a thread the plugin started, import) fails the test. `orca_driver.Page` plays the tab, and `orca.host.ui.create_window` records the claim page windows (`orca_driver.window_message` and `close_window` play them). Only `plugin.py`, `page.py`, `claim_window.py`, `plate.py` and `script.py` import `orca`.
 
 Releases: pushing a `v*` tag builds the wheel and attaches it to a GitHub release.
 

@@ -76,7 +76,7 @@ def test_defaults():
 
     assert settings == controller.Settings(
         template="default",
-        open_claim_page="tab",
+        open_claim_page="window",
         api_base="https://api.3dprintlog.com",
         web_base="https://www.3dprintlog.com",
         slice_notification=True,
@@ -184,7 +184,77 @@ def test_a_slice_without_a_model_name_is_named_for_the_plate(env):
 
     sliced(ctl, temp, model="  ")
 
-    assert items(ctl)[0]["name"] == "Unnamed plate"
+    assert items(ctl)[0]["name"] == "Your plate"
+
+
+def test_tab_is_the_old_name_of_window():
+    raw = json.dumps({"open_claim_page": "tab"})
+
+    assert controller.parse_settings(raw).open_claim_page == "window"
+    assert controller.parse_settings(
+        json.dumps({"open_claim_page": "browser"})
+    ).open_claim_page == ("browser")
+
+
+def test_the_display_name_names_an_unnamed_slice_in_the_tab_and_the_notification(env):
+    ctl, *_, temp, _ = env
+    sliced(ctl, temp, model="")
+
+    assert ctl.needs_display_name() is True
+    text = ctl.slicing_done("Desk organizer")
+
+    assert text == "Sliced Desk organizer. Open the 3D Print Log tab to log it."
+    assert items(ctl)[0]["name"] == "Desk organizer"
+    assert ctl.needs_display_name() is False
+
+
+def test_the_events_name_beats_the_display_name(env):
+    ctl, *_, temp, _ = env
+    sliced(ctl, temp, model="Benchy")
+
+    assert ctl.needs_display_name() is False
+    assert ctl.slicing_done("Desk organizer").startswith("Sliced Benchy.")
+    assert items(ctl)[0]["name"] == "Benchy"
+
+
+def test_without_any_name_the_notification_says_your_plate(env):
+    ctl, *_, temp, _ = env
+    sliced(ctl, temp, model="")
+
+    assert ctl.slicing_done("") == "Sliced your plate. Open the 3D Print Log tab to log it."
+    assert items(ctl)[0]["name"] == "Your plate"
+
+
+def test_the_display_name_is_kept_with_notifications_off(env):
+    ctl, _, _, temp, config = env
+    config["slice_notification"] = False
+    sliced(ctl, temp, model="")
+
+    assert ctl.slicing_done("Desk organizer") is None
+    assert items(ctl)[0]["name"] == "Desk organizer"
+
+
+def test_the_display_name_does_not_name_the_upload(env):
+    ctl, api, storage, temp, _ = env
+    sliced(ctl, temp, model="")
+    ctl.slicing_done("Desk organizer")
+
+    log(ctl, storage, items(ctl)[0]["id"])
+
+    (body,) = api.calls
+    assert b"Desk organizer" not in body
+
+
+def test_the_claim_url_is_only_for_a_logged_slice(env):
+    ctl, _, storage, temp, _ = env
+    sliced(ctl, temp)
+    slice_id = items(ctl)[0]["id"]
+
+    assert ctl.claim_url(slice_id) is None
+    log(ctl, storage, slice_id)
+
+    assert ctl.claim_url(slice_id) == items(ctl)[0]["claimUrl"]
+    assert ctl.claim_url(999) is None
 
 
 @pytest.mark.parametrize(
@@ -231,7 +301,7 @@ def test_log_marks_uploading_then_uploads_once_and_returns_the_claim_url(env):
 
     assert done["kind"] == "logged"
     assert done["url"].endswith(f"settingId={SETTING_ID}")
-    assert done["mode"] == "tab"
+    assert done["mode"] == "window"
     assert len(api.calls) == 1
     (item,) = items(ctl)
     assert item["status"] == "logged"

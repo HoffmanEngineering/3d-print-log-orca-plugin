@@ -23,6 +23,16 @@ def browser(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_claim_window():
+    """Each test starts in a fresh Orca: no claim page window left open by the one before."""
+    from printlog_orca import claim_window
+
+    claim_window._current.clear()
+    yield
+    claim_window._current.clear()
+
+
+@pytest.fixture(autouse=True)
 def audit_guard():
     """Fails a test in which the plugin did I/O outside an audit context (a thread it started, a
     notification's on_click, import): that skips the user's consent."""

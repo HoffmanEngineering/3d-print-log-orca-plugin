@@ -9,7 +9,15 @@ import sys
 import zipfile
 
 PACKAGE = "printlog_orca"
-MODULES = ["__init__.py", "plugin.py", "page.py", "page_html.py", "script.py"]
+MODULES = [
+    "__init__.py",
+    "plugin.py",
+    "page.py",
+    "page_html.py",
+    "claim_window.py",
+    "plate.py",
+    "script.py",
+]
 
 
 def check(path):
