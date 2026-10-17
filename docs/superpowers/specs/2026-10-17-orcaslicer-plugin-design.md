@@ -144,8 +144,7 @@ Request: `multipart/form-data` with
 carry the raw centerline bounds; the library adds the line width exactly as `ModelsPlaceholder` does.
 
 Server steps: check sizes, gunzip with a cap, scrub the text with `SlicerSettingsScrubber`, scrub each preset, parse
-with the new library entry point (below), set `print_name` / `file_name` from `outputName` the way the uploader's
-`PrintMetadata.Apply` does, and store a `CuraSetting` with `Slicer` = the detected slicer, `CuraVersion` = the slicer
+with the new library entry point (below, passing `outputName` as `OutputName`; a bad `template` is a 400), and store a `CuraSetting` with `Slicer` = the detected slicer, `CuraVersion` = the slicer
 version, `PluginVersion` = `orca-plugin/<pluginVersion>`.
 
 Responses:
@@ -172,16 +171,33 @@ public static class SlicerGcodeParser
 }
 
 public sealed record SlicerGcodeOptions(
-    string Template,                                // "default" or "full"
+    string Template,                                // "default" or "full", case-insensitive; else ArgumentException
     IReadOnlyList<ModelBounds> Models,              // replaces the toolpath scan for {{models}}
-    IReadOnlyList<UserPresetFile> UserPresets,      // replaces reading slicer config roots for {{modified_settings}}
-    Action<string>? DebugLog = null);
+    IReadOnlyList<UserPresetFile> UserPresets)      // replaces reading slicer config roots for {{modified_settings}}
+{
+    public string? OutputName { get; init; }        // sets print_name and file_name, as the uploader's PrintMetadata does
+    public Action<string>? DebugLog { get; init; }
+}
+
+public sealed record ModelBounds(string Name, double MinX, double MaxX, double MinY, double MaxY, double MaxZ);
+public sealed record UserPresetFile(string Kind, string Name, string Json);
+
+public sealed class SlicerGcodeResult
+{
+    public string Slicer { get; }
+    public string Version { get; }
+    public bool IsRecognized { get; }
+    public string SettingsJson { get; }             // the uploader's CuraSettings, same serializer
+}
 ```
 
-`SlicerGcodeResult` carries the slicer, version and the uploader's `settings` object, serialized exactly as the
-uploader serializes it (note, estimated time, filament weight or per-slot usage, snapshot), so the API stores the same
-JSON the uploader would send. It never touches the disk or network. The uploader keeps its current path; internally
-`ParseOptions` gains the two in-memory sources and both callers share one parse.
+`SettingsJson` is the uploader's `settings` object, serialized exactly as the uploader serializes it (note, print
+name, estimated time, filament weight or per-slot usage, snapshot, file name), so the API stores the same JSON the
+uploader would send. The print-title rules moved from the uploader's `TitleService` into the library, so both use one
+implementation; they split `OutputName` on `/` and `\`. It never touches the disk or network and never throws for any
+text; it does not decode `.bgcode`. Models are capped at 1,000 and names at 256 characters. The uploader keeps its
+current path; internally `ParseOptions` gains the two in-memory sources and both callers share one parse.
+(Shipped in Slic3rPostProcessingUploader#89.)
 
 The public surface grows on purpose (the pinned list in `SlicerConfigParserTests.PublicSurface_*` is updated), and it
 ships as `PrintLog.SlicerSettings` 0.2.0 via a `lib-v0.2.0` tag.
