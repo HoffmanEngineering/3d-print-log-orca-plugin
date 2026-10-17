@@ -51,3 +51,14 @@ Three stories in three repos. Each is TDD and lands as one PR. A and B run in pa
 ## After the alpha is installed (Chris)
 
 Run the spec's spike list. Fix what it finds, then tag `v0.1.0` of the plugin.
+
+## A2. Consent rework (plugin, same branch)
+
+The spec's Decision 3 (A2 + B4, B2 fallback). TDD, one commit each:
+
+1. Fake `orca`: modal prompts on the UI thread (answerable, `PermissionError` on No), denial off it, strict
+   tracking of plugin I/O outside an audit context, `orca.pages` and a `Page` driver, UI-only notifications.
+2. Plugin: drop the background thread; events only record; the "3D Print Log" Pages tab with the two-message Log
+   flow; the synchronous uploader; `installId`; Open in browser; the hook keeps a copy; the script uploads in
+   place; `PrintJobStarted` replaces the `PrintStateChanged` heuristic.
+3. Docs: spec, README, PR body.
