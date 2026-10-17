@@ -5,11 +5,11 @@
 #      and the permission-prompt watcher.
 #   1. First-run wizard (Klipper + Bambu X1 Carbon, stealth mode), unless a datadir snapshot was given.
 #   2. Install the plugin wheel the way Orca's "Install local plugin" lays it out, enabled, with no
-#      permissions granted; write its config (local API and web addresses, claim page in the tab).
+#      permissions granted; write its config (local API and web addresses, claim page in an Orca window).
 #   3. Sessions, each a fresh Orca on the same datadir (see run_session). Every session records the
 #      permission prompts it showed (prompts/NN-<session>-<what>.png):
 #        session1  Klipper: slice, notification, open the 3D Print Log tab, Log (answer Yes to every
-#                  prompt), the claim page opens in the tab, Back to OrcaSlicer (screenshots).
+#                  prompt), the claim page opens in its own Orca window: Back to OrcaSlicer, close box, save.
 #                  The UI freeze during Log is measured with _NET_WM_PING      -> exactly 1 upload
 #        session2  restart, slice, Log                                         -> 1 upload
 #        session3  restart, slice, Log, answer No to the first prompt: the tab says it was declined
@@ -256,7 +256,7 @@ cp "$PLUGIN_DIR/.install_state.json" "$OUT/install-state-after-load.json"
 # orca_plugins/config.json. No capability_type: Orca treats such an entry as the config of that
 # capability name whatever its type.
 CONFIG=$(jq -n --arg api "$API_BASE" --arg web "$WEB_BASE" \
-    '{api_base: $api, web_base: $web, open_claim_page: "tab", debug: true, slice_notification: true, template: "default"}')
+    '{api_base: $api, web_base: $web, open_claim_page: "window", debug: true, slice_notification: true, template: "default"}')
 echo "$CAPS" | jq -R --arg v "$VERSION" --argjson cfg "$CONFIG" \
     '{plugin_key: "3d-print-log", capability: ., plugin_version: $v, cap_config: $cfg}' \
     | jq -s '{config: .}' >"$DATADIR/orca_plugins/config.json"
@@ -269,7 +269,6 @@ TAB_X=782; TAB_Y=54            # the "3D Print Log" tab, right of Project
 LOG_X=1490; LOG_Y=185          # "Log to 3D Print Log" on the newest slice (the top row)
 BROWSER_X=1511; BROWSER_Y=107  # "Open in browser"
 PRINT_X=1524; PRINT_Y=54       # Print (a printer with a print host), top right in Preview
-BACK_X=343; BACK_Y=262         # the claim page's "Back to OrcaSlicer"
 
 select_presets() { # select_presets <printer preset> <process preset>: what Orca selects on its next start
     local c=$DATADIR/OrcaSlicer.conf
@@ -300,10 +299,6 @@ slice() { # slice: focus the 3D view, Slice plate (Ctrl+R), wait for SlicingJobC
 }
 claim_url_on_web_base() { jq -r .url "$STORAGE/debug/last-upload.json" 2>/dev/null | grep -q "^$WEB_BASE/prints/new"; }
 open_tab() { click "$TAB_X" "$TAB_Y" 1 4; }
-scroll() { # scroll up|down <clicks>: the mouse wheel over the page in the tab
-    local button=5; [ "$1" = up ] && button=4
-    xdotool mousemove 1300 600; for _ in $(seq 1 "$2"); do xdotool click "$button"; sleep 0.05; done; sleep 1
-}
 log_slice() { # log_slice <label> [uploads before]: click Log on the newest slice and wait for the upload,
     # measuring how long the UI thread stops answering (freeze-<label>.txt: one ping per line)
     local label=$1 before=${2:-0} w
@@ -312,7 +307,7 @@ log_slice() { # log_slice <label> [uploads before]: click Log on the newest slic
     local pinger=$!
     xdotool mousemove "$LOG_X" "$LOG_Y" click 1
     wait_uploads $((before + 1)) 60 || log "$label: no upload within 60 s"
-    sleep 6   # the tab navigates to the claim page
+    sleep 6   # the claim page window opens and loads
     kill "$pinger" 2>/dev/null; wait "$pinger" 2>/dev/null
     log "$label: longest UI stall $(sort -k2 -n "$OUT/freeze-$label.txt" | tail -1 | awk '{print $2}') ms"
 }
@@ -342,19 +337,55 @@ run_session() { # run_session <name> <printer> <process> <expected uploads> <act
     check "session $name: $expected upload(s), got $got" test "$got" -eq "$expected"
 }
 
+# The claim page opens in its own Orca window titled "3D Print Log" (1040x820). Its position
+# varies (centered over Orca the first time, top left when reopened), so clicks in it are
+# relative to its client area: claim_window sets WX, WY, WW, WH.
+claim_window() { # claim_window [timeout s]: true once the window is up
+    local deadline=$(( $(date +%s) + ${1:-20} )) w X Y WIDTH HEIGHT
+    until w=$(xdotool search --onlyvisible --name '^3D Print Log$' 2>/dev/null | tail -1) && [ -n "$w" ]; do
+        [ "$(date +%s)" -lt "$deadline" ] || return 1; sleep 0.5
+    done
+    eval "$(xdotool getwindowgeometry --shell "$w")"; WX=$X; WY=$Y; WW=$WIDTH; WH=$HEIGHT
+}
+claim_window_gone() { sleep 2; ! xdotool search --onlyvisible --name '^3D Print Log$' >/dev/null 2>&1; }
+wscroll() { # wscroll up|down <clicks>: the mouse wheel over the claim window
+    local button=5; [ "$1" = up ] && button=4
+    xdotool mousemove $((WX + 500)) $((WY + 400)); for _ in $(seq 1 "$2"); do xdotool click "$button"; sleep 0.05; done; sleep 1
+}
+open_claim_page() { # the logged slice's "Open claim page" (the row moves down when the tab shows a notice)
+    local y; for y in 208 178; do click 1496 "$y" 1 1; claim_window 8 && return 0; done; return 1
+}
 session1() {
     slice
     shot "session1-notification"
     open_tab
     shot "session1-tab-light"
     log_slice session1 0
-    sleep 4; shot "session1-claim-page"
-    scroll down 10; shot "session1-claim-material"
-    scroll down 10; shot "session1-claim-models"
-    scroll up 30; shot "session1-claim-top"
-    click "$BACK_X" "$BACK_Y" 1 5      # Back to OrcaSlicer
+    check "session1: the claim page opened in an Orca window" claim_window 15
+    sleep 3; shot "session1-claim-window"
+    wscroll down 10; shot "session1-claim-material"
+    wscroll down 10; shot "session1-claim-models"
+    wscroll up 30
+    click $((WX + 223)) $((WY + 165)) 1 1          # Back to OrcaSlicer
+    check "session1: Back to OrcaSlicer closed the window" claim_window_gone
     shot "session1-back-to-list"
-    sleep 10; shot "session1-back-to-list-later"
+    check "session1: Open claim page reopened the window" open_claim_page
+    sleep 4; shot "session1-claim-reopened"
+    click $((WX + WW - 11)) $((WY - 31)) 1 1       # the window's close box (openbox title bar)
+    check "session1: the close box closed the window" claim_window_gone
+    open_claim_page; sleep 4
+    xdotool mousemove $((WX + 900)) $((WY + 500)) click 3; sleep 1
+    shot "session1-claim-right-click"              # Back is greyed out: the claim page is the first entry
+    xdotool key Escape; sleep 0.5
+    # Save inside the window: pick the seeded printer, Submit, then "Done, back to OrcaSlicer".
+    wscroll down 5
+    click $((WX + 498)) $((WY + 442)) 1 2          # Printer
+    click $((WX + 298)) $((WY + 501)) 1 2          # the first printer
+    click $((WX + 467)) $((WY + 741)) 1 6          # Submit
+    shot "session1-print-saved"
+    click $((WX + 252)) $((WY + 222)) 1 1          # Done, back to OrcaSlicer
+    check "session1: Done closed the window" claim_window_gone
+    shot "session1-after-save"
     check "session1: the claim page URL is on $WEB_BASE" claim_url_on_web_base
 }
 session_log() { slice; open_tab; shot "$(cat /tmp/scenario)-tab"; log_slice "$(cat /tmp/scenario)" 0; sleep 4; shot "$(cat /tmp/scenario)-claim-page"; }
@@ -424,7 +455,7 @@ bambu() {
 
 browser_mode() {
     # open_claim_page "browser" and a new install id (as on another computer): Log uploads, then
-    # opens this install's uploads page in the browser instead of the claim page in the tab. With
+    # opens this install's uploads page in the browser instead of the claim page window. With
     # exactly one fresh upload, the web app opens it straight away (checked from the host).
     slice; open_tab
     local before; before=$(wc -l <"$OUT/browser-urls.log")
@@ -432,8 +463,9 @@ browser_mode() {
     shot "browser-mode-after-log"
     check "browser-mode: Log opened the uploads page in the browser" \
         test "$(wc -l <"$OUT/browser-urls.log")" -gt "$before"
+    check "browser-mode: no claim page window" claim_window_gone
 }
-set_open_mode() { # set_open_mode tab|browser
+set_open_mode() { # set_open_mode window|browser
     jq --arg m "$1" '.config |= map(.cap_config.open_claim_page = $m)' "$DATADIR/orca_plugins/config.json" >/tmp/cfg \
         && cp /tmp/cfg "$DATADIR/orca_plugins/config.json"
 }

@@ -24,7 +24,7 @@ its own `--datadir` inside the container.
    says `enabled: true` and grants no permissions, so every prompt the plugin causes shows up.
    Orca loads it on start; the run checks that it registered its capabilities. The plugin config
    goes to `orca_plugins/config.json`: `api_base` = the local API, `web_base` =
-   `http://localhost:4320`, `open_claim_page` = `"tab"`, `debug` on. `BROWSER` points at
+   `http://localhost:4320`, `open_claim_page` = `"window"`, `debug` on. `BROWSER` points at
    `scripts/browser.sh`, which only logs the URL.
 3. **Sessions**, each a fresh Orca on the same datadir with a 20 mm cube from the command line and
    the main window filling the 1600x1000 screen. Presets are picked by editing `OrcaSlicer.conf`
@@ -32,7 +32,7 @@ its own `--datadir` inside the container.
 
    | Session | Printer | Does | Expects |
    |---|---|---|---|
-   | session1 | Generic Klipper | slice, screenshot the notification, open the **3D Print Log** tab, **Log to 3D Print Log**, Yes to every prompt; the tab opens the claim page; scroll it; **Back to OrcaSlicer** | 1 upload, claim page on `localhost:4320` |
+   | session1 | Generic Klipper | slice, screenshot the notification, open the **3D Print Log** tab, **Log to 3D Print Log**, Yes to every prompt; the claim page opens in its own Orca window ("3D Print Log"); scroll it; **Back to OrcaSlicer**; **Open claim page**; the close box; reopen, right-click; pick the printer, **Submit**, **Done, back to OrcaSlicer** | 1 upload; the window opens, closes from Back, the close box and Done; the tab keeps its list |
    | session2 | Generic Klipper | restart, slice, Log | 1 upload |
    | session3 | Generic Klipper | restart, slice, Log, **No** to the first prompt (screenshot of the declined message), Log again (asked again), Yes | 1 upload |
    | session4 | Generic Klipper | restart in dark mode (Orca's setting and `GTK_THEME=Adwaita:dark`), slice, Log | 1 upload |
@@ -132,53 +132,62 @@ alone (the real plugin is not installed), every prompt is answered **Yes**, and 
 to see whether the grants persist. It was written for the earlier background-thread design and
 is kept for reference; the sessions above cover the tab design.
 
-## What the 2.5.0-alpha showed (2026-10-17, plugin 0.1.0, tab design)
 
-Two full runs; the second passed every check (21 in the container, all of `verify.py`).
+## What the 2.5.0-alpha showed (2026-10-17, plugin 0.1.0 at 127c894, claim page window)
+
+The last run passed every check (27 in the container, all of `verify.py`). Earlier runs on the
+0.1.0 tab design (claim page inside the tab) are summarized at the end.
 
 - **The tab**: "3D Print Log" sits right of Project. Below about 1300 px of window width Orca
   drops it from the tab strip with nothing to show it is there (1250 px: gone; 1300 px: shown).
-- **Notification**: "Sliced the plate. Open the 3D Print Log tab to log it." Every slice is
-  listed as **Unnamed plate**: `GCodeExportFinished` carries an empty `ctx.name`, so the plugin
-  never learns the model name (the upload itself is named Cube from the G-code).
-- **Log**: the row shows "Uploading..." behind the prompts, then the tab navigates to the claim
-  page (`/prints/new/cura?...settingId=...`), signed in through the dev-auth bypass, with "Back to
-  OrcaSlicer" at the top. The form has the snapshot, title Cube, 9m 29s, Models
-  `cube.stl x1 20.0 x 20.0 x 20.0 mm`, file `cube.gcode`. Material usage shows **Length 1.341 m**:
-  the row stores 4000 mg as well, but with `estimatedSource` = Length, so the form opens on length.
-- **Back to the list is broken**: after the claim page loads, "Back to OrcaSlicer" and Orca's
-  own right-click **Back** both land on a blank page (Back is then greyed out: it is the first
-  history entry, the HTML the plugin gave Orca). Reload and switching tabs do not bring the list
-  back; only a restart does. It only worked in an early probe where the claim page failed to load.
+- **Notification**: "Sliced cube. Open the 3D Print Log tab to log it."; the list names the slice
+  "cube".
+- **Log**: the row shows "Uploading..." behind the prompts, then a modeless "3D Print Log" window
+  (1038x795 client area) opens over Orca, centered the first time, with the claim page signed in
+  (the dev-auth bypass; the tab and the window share the web view's storage). The tab keeps its
+  list and shows "Logged. The claim page opened in an OrcaSlicer window." Opening the window
+  asks for no permission.
+- **Claim form**: snapshot, title Cube, 9m 29s, filament usage **4 g, Measure: Weight**, the note
+  lists `cube.stl x1 20.0 x 20.0 x 20.0 mm` (checked in the stored row).
+- **Closing**: "Back to OrcaSlicer" closes the window and the tab shows Logged; **Open claim page**
+  reopens it (at the top left of the screen, not centered); the window's close box closes it.
+  Right-click **Back** is greyed out on the claim page (it is the window's first history entry),
+  so it closes nothing there; after navigating inside the window it goes back as in a browser.
+- **Save inside the window**: picking the printer and Submit shows the "Print saved" card ("Your
+  print is saved to 3D Print Log. You can close this window."); **Done, back to OrcaSlicer**
+  closes the window. The tab never went blank.
 - **Declined**: answering No shows "Orca blocked the upload because permission was declined.
   Click Log again to be asked again." in red, nothing is sent, and Log asks again.
 - **Print host**: the send to OctoPrint uploads nothing; the tab marks the slice "Sent to a print
   host"; Log uploads it once (as `cube.gcode`: without the hook in the preset the plugin logs
   Orca's plate G-code, not the host file name).
 - **Slice only** (Klipper and Bambu): no upload, no prompt.
-- **Open in browser**: opens `{web_base}/prints/new/orca?device=<install id>`. In the web app that
-  page lists the install's uploads, and with exactly one fresh upload it opens it straight away.
-  `open_claim_page: "browser"` opens the same page after each Log ("Logged. Claim it in your
-  browser."), but the tab's footer still says the claim page opens in the tab.
-- **Prompts per session** (answers Yes unless noted; they differ between runs, because each Yes
-  is saved for its exact target and Python opens some modules lazily):
+- **Open in browser** opens `{web_base}/prints/new/orca?device=<install id>`: the web app lists
+  the install's uploads, and with exactly one fresh upload opens it straight away. With
+  `open_claim_page: "browser"`, Log shows "Logged. Claim it in your browser." and the footer
+  "Log opens your browser at the prints this OrcaSlicer uploaded, where you claim it." The print
+  saved in session1 still appears in its install's list (marked "Already opened").
+- **Dark mode**: with Orca dark (`dark_color_mode` plus `GTK_THEME=Adwaita:dark` on Linux), the
+  tab and the claim page window follow it.
+- **Prompts per session** (Yes unless noted; the same in all three runs except where shown):
 
-  | Session | Run 1 | Run 2 |
-  |---|---|---|
-  | 1 | read temp G-code; HTTP request `http://host.docker.internal:5101/api/Slicer/uploads` | same |
-  | 2 | read temp G-code; HTTP request `host.docker.internal` (twice) | read temp G-code; HTTP request `host.docker.internal` |
-  | 3 | read temp G-code (No), read temp G-code, read `encodings/__pycache__/idna.cpython-312.pyc` | same |
-  | 4 | read temp G-code; read `__pycache__/stringprep.cpython-312.pyc` | same |
-  | host | (send failed in run 1) | read temp G-code; read `encodings/__pycache__/utf_8_sig.cpython-312.pyc`; open a network connection to `host.docker.internal` |
-  | slice (Open in browser) | read/write `/dev/null` | same |
-  | bambu (Open in browser) | none | none |
-  | browser-mode (new install id) | read temp G-code; open a network connection to `host.docker.internal`; audit event `open` (no target) | read temp G-code; audit event `socket.__new__` (no target); audit event `open` (no target) |
+  | Session | Prompts |
+  |---|---|
+  | 1 | read the temp G-code; HTTP request `http://host.docker.internal:5101/api/Slicer/uploads` |
+  | 2 | read the temp G-code; HTTP request to host `host.docker.internal` (asked twice in one run) |
+  | 3 | read the temp G-code (**No**); read it again; read `encodings/__pycache__/idna.cpython-312.pyc` |
+  | 4 | read the temp G-code; read `__pycache__/stringprep.cpython-312.pyc` |
+  | host | read the temp G-code; read `encodings/__pycache__/utf_8_sig.cpython-312.pyc`; open a network connection to `host.docker.internal` |
+  | slice (Open in browser) | read/write `/dev/null` |
+  | bambu (Open in browser) | none |
+  | browser-mode (new install id) | read the temp G-code; audit event `socket.__new__` or a network connection to the host; audit event `open` (no target) |
 
-  The temp G-code is asked for on every Log in every session (its path changes per slice). No
-  prompt ever said "run the following command": opening the browser asked only for `/dev/null`
-  (once) and the browser started (with `BROWSER` set to a script; a desktop's `xdg-open` may
-  differ).
-- **Freeze** (longest stall of Orca's UI thread per Log click, prompts excluded): run 1 1369,
-  3422, 709, 310, 81 ms; run 2 550, 121, 84, 79, 86, 115 ms. The first upload of a session is the
-  slow one (connection set-up, idna); later ones are under 0.15 s against a local API.
-- **Dark mode**: with Orca dark, the tab and the claim page follow it.
+  The temp G-code is asked for on every Log (its path changes per slice); the others depend on
+  which grants earlier sessions saved and which modules Python loads lazily. No prompt ever said
+  "run the following command": opening the browser asked only for `/dev/null` (with `BROWSER` set
+  to a script; a desktop's `xdg-open` may differ).
+- **Freeze** (longest stall of Orca's UI thread per Log click, prompts excluded): 962, 1206, 71,
+  65, 71, 77 ms in the last run; 550 to 3422 ms on a session's first upload across runs, under
+  0.15 s after that.
+- **Tab design (claim page inside the tab, before 127c894)**: "Back to OrcaSlicer" and right-click
+  Back both left the tab blank for the rest of the session. The window design fixes that.
