@@ -1,0 +1,49 @@
+[build-system]
+# import-names (Core Metadata 2.5 Import-Name) needs hatchling 1.28+. OrcaSlicer reads it to find
+# the package to import, because the distribution name does not normalize to printlog_orca.
+requires = ["hatchling>=1.28"]
+build-backend = "hatchling.build"
+
+[project]
+name = "3d-print-log-orca-plugin"
+dynamic = ["version"]
+description = "Sends each OrcaSlicer print you send or export to 3D Print Log."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Hoffman Engineering" }]
+# OrcaSlicer 2.5 embeds CPython 3.12.
+requires-python = ">=3.12"
+dependencies = []
+import-names = ["printlog_orca"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+
+# A dependency group, not an extra: OrcaSlicer installs every Requires-Dist line of a wheel.
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.5", "build>=1"]
+
+[project.urls]
+Homepage = "https://www.3dprintlog.com"
+Source = "https://github.com/HoffmanEngineering/3d-print-log-orca-plugin"
+
+[tool.hatch.version]
+path = "src/printlog_orca/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/printlog_orca"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip && pip install -e . --group dev
+      - run: pytest
+      - name: The tag matches the package version
+        run: |
+          version=$(python -c "import re, pathlib; print(re.search(r'__version__ = \"(.+)\"', pathlib.Path('src/printlog_orca/__init__.py').read_text()).group(1))")
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, package $version"; exit 1; }
+      - run: python -m build --wheel
+      - run: python scripts/check_wheel.py dist/*.whl
+      # OrcaSlicer names the plugin's key, install folder, config and storage after the file
+      # name. A versioned name would install each release as a separate plugin; a fixed one
+      # makes a new release replace the old one in place.
+      - run: cp dist/*.whl dist/3d-print-log.whl && python scripts/check_wheel.py dist/3d-print-log.whl
+      - name: GitHub release with the wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/3d-print-log.whl --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
