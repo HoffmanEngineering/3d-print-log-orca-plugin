@@ -1,8 +1,9 @@
-"""A slice in Orca reaches a local API as one multipart POST, through the real background thread
-and worker, with the fake audit hook refusing anything Orca would ask about."""
+"""A slice in Orca reaches a local API as one multipart POST when the user clicks Log in the tab:
+the real client, uploader and page, with the fake audit hook playing Orca's prompts."""
 
 import gzip
 import json
+import re
 import threading
 from email import message_from_bytes
 from email.policy import HTTP
@@ -12,36 +13,36 @@ from pathlib import Path
 import orca
 import orca_driver
 import pytest
-from orca.host import ui
+from orca import _audit
 
-from printlog_orca import controller
+from printlog_orca import controller, uploader
 
 FIXTURE = Path(__file__).parent / "fixtures" / "orcaslicer-2.2.0-rc-calibration-cube.gcode.gz"
+SETTING_ID = "11111111-2222-3333-4444-555555555555"
+Event = orca.LifecycleEvent
 
 
 @pytest.fixture
 def api():
     received = []
-    arrived = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802 - http.server's name
             body = self.rfile.read(int(self.headers["Content-Length"]))
             received.append((self.path, self.headers["Content-Type"], body))
-            answer = b'{"newSettingId":"11111111-2222-3333-4444-555555555555"}'
+            answer = json.dumps({"newSettingId": SETTING_ID}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(answer)))
             self.end_headers()
             self.wfile.write(answer)
-            arrived.set()
 
         def log_message(self, *args):
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
-    yield f"http://127.0.0.1:{server.server_address[1]}", received, arrived
+    yield f"http://127.0.0.1:{server.server_address[1]}", received
     server.shutdown()
     server.server_close()
 
@@ -58,92 +59,128 @@ def parse(received):
     return metadata, text
 
 
+class Tab:
+    def __init__(self, capability):
+        self.page = orca_driver.Page(capability)
+        self.token = re.search(r'var TOKEN = "([0-9a-f]{32})"', self.page.html).group(1)
+        self.send("ready")
+
+    def send(self, kind, **extra):
+        (reply,) = self.page.send({"type": kind, "token": self.token, **extra})
+        return reply
+
+    def log_latest(self):
+        slice_id = self.send("refresh")["slices"][0]["id"]
+        assert self.send("log", id=slice_id)["event"]["kind"] == "uploading"
+        return self.send("upload", id=slice_id)["event"]
+
+
 @pytest.fixture
 def orca_app(api, tmp_path, monkeypatch, plugin_log):
-    base, received, arrived = api
+    base, received = api
     storage = tmp_path / "OrcaSlicer" / "orca_plugins" / "plugin_data" / "3d-print-log"
     storage.mkdir(parents=True)
     orca_driver.reset(storage)
-    ctl = controller.Controller(notify_delay=0)  # the real background thread and worker
-    monkeypatch.setattr(controller, "shared", ctl)
+    monkeypatch.setattr(controller, "shared", controller.Controller())  # the real client
     capabilities = orca_driver.load()
     orca_driver.on_load(capabilities)
-    capabilities["3D Print Log uploader"].save_config(
-        json.dumps({"api_base": base, "open_browser": False, "debug": True})
-    )
+    capabilities["3D Print Log uploader"].save_config(json.dumps({"api_base": base, "debug": True}))
     temp = tmp_path / "Temp" / "orcaslicer_model" / "Metadata"  # outside data_dir
     temp.mkdir(parents=True)
     plate = temp / ".1234.0.gcode"
     plate.write_bytes(gzip.decompress(FIXTURE.read_bytes()))
-    yield capabilities, ctl, storage, plate, received, arrived
-    ctl.background.stop()
+    tab = Tab(capabilities["3D Print Log"])
+    yield capabilities, tab, storage, plate, received
     errors = [r.getMessage() for r in plugin_log if r.levelno >= 40]
     assert errors == []
 
 
-def wait_for_cleanup(ctl, storage):
-    assert ctl.background.wait_idle(30)
-    debug = storage / "debug" / "last-upload.json"
-    assert json.loads(debug.read_text(encoding="utf-8"))["result"]["ok"] is True
-    assert list((storage / "uploads" / "jobs").iterdir()) == []
+def slice_plate(capabilities, plate, model="Calibration Cube"):
+    ctx = orca.LifecycleEventContext(name=model, msg=str(plate))
+    orca_driver.fire(capabilities, Event.GCodeExportFinished, ctx)
+    orca_driver.fire(capabilities, Event.SlicingJobComplete, orca.LifecycleEventContext(name=model))
 
 
-def test_a_slice_then_the_notification_link_uploads_once(orca_app):
-    capabilities, ctl, storage, plate, received, arrived = orca_app
+def test_log_in_the_tab_uploads_once_with_orcas_prompts_on_the_ui_thread(orca_app):
+    capabilities, tab, storage, plate, received = orca_app
+    slice_plate(capabilities, plate)
+    assert received == []
+    assert _audit.prompts == []
 
-    ctx = orca.LifecycleEventContext(name="Calibration Cube", msg=str(plate))
-    orca_driver.fire(capabilities, orca.LifecycleEvent.GCodeExportFinished, ctx)
-    assert ui.wait_for_notifications(1)
-    orca_driver.click(ui.notifications[0])
+    event = tab.log_latest()
 
-    assert arrived.wait(30)
-    wait_for_cleanup(ctl, storage)
+    assert event["kind"] == "logged"
+    assert event["url"].endswith(f"settingId={SETTING_ID}")
     metadata, text = parse(received)
     assert metadata["outputName"] == "Calibration Cube.gcode"
     assert metadata["host"] == "File"
     assert metadata["slicerVersion"]  # from the G-code header
+    assert metadata["installId"] == json.loads((storage / "install.json").read_text())["installId"]
     assert [m["name"] for m in metadata["models"]] == ["Calibration Cube.stl"]
     assert "; generated by OrcaSlicer" in text
     assert plate.exists()
+    # Orca asked for the file, then the URL; the URL's Yes covered the rest of the request.
+    assert [(c, k) for c, _, k, _ in _audit.prompts] == [("file", "ui"), ("network", "ui")]
+    assert any(category == "network" for category, *_ in _audit.audited)
+    assert _audit.network_on_ui_thread_only()
+    debug = json.loads((storage / "debug" / "last-upload.json").read_text(encoding="utf-8"))
+    assert debug["result"]["ok"] is True
 
 
-def test_a_print_host_upload_uploads_once_with_no_preset_step(orca_app):
-    capabilities, ctl, storage, plate, received, arrived = orca_app
-
-    ctx = orca.LifecycleEventContext(name="", msg=str(plate))
-    orca_driver.fire(capabilities, orca.LifecycleEvent.GCodeExportFinished, ctx)
+def test_a_print_host_upload_is_logged_from_the_tab_under_the_model_name(orca_app):
+    capabilities, tab, _, plate, received = orca_app
+    slice_plate(capabilities, plate, model="")
     up = orca.LifecycleEventContext(name=".OrcaSlicer.upload.1a2b-3c4d-5e6f-7a8b")
-    orca_driver.fire(capabilities, orca.LifecycleEvent.UploadStarted, up)
+    orca_driver.fire(capabilities, Event.UploadStarted, up)
+    assert received == []
 
-    assert arrived.wait(30)
-    wait_for_cleanup(ctl, storage)
+    assert tab.log_latest()["kind"] == "logged"
+
     metadata, _ = parse(received)
     assert metadata["host"] == "PrintHost"
     assert metadata["outputName"] == "Calibration Cube.gcode"  # named after the object
 
 
-def test_the_optional_hook_uploads_an_export_once(orca_app, tmp_path):
-    capabilities, ctl, storage, plate, received, arrived = orca_app
-    ctx = orca.LifecycleEventContext(name="Calibration Cube", msg=str(plate))
-    orca_driver.fire(capabilities, orca.LifecycleEvent.GCodeExportFinished, ctx)
+def test_the_hooks_export_is_logged_without_any_file_prompt(orca_app, tmp_path):
+    capabilities, tab, _, plate, received = orca_app
+    slice_plate(capabilities, plate)
     working = plate.with_name(plate.name + ".pp")
     working.write_bytes(plate.read_bytes())
-
     hook_ctx = orca.slicing.SlicingPipelineContext(
         gcode_path=str(working),
         host="File",
         output_name=str(tmp_path / "Calibration Cube_PLA_20m.gcode"),
         config={"print_settings_id": "0.20mm Standard @Voron", "printer_settings_id": "Voron"},
     )
-    result = orca_driver.execute(capabilities["3D Print Log uploader"], hook_ctx)
+    orca_driver.execute(capabilities["3D Print Log uploader"], hook_ctx)
+    working.unlink()
 
-    assert result.status == orca.PluginResult.Success
-    assert arrived.wait(30)
-    wait_for_cleanup(ctl, storage)
+    assert tab.log_latest()["kind"] == "logged"
+
     metadata, _ = parse(received)
     assert metadata["outputName"] == "Calibration Cube_PLA_20m.gcode"
-    assert working.exists()
-    for note in ui.notifications:  # the slice's notification, if it showed: now a no-op
-        orca_driver.click(note)
-    assert ctl.background.wait_idle(30)
-    assert len(received) == 1
+    assert [c for c, *_ in _audit.prompts] == ["network"]
+
+
+def test_the_audit_guard_catches_an_upload_moved_onto_a_plugin_thread(orca_app, monkeypatch):
+    """The regression the consent design exists to prevent: if the upload ran on a thread the
+    plugin started (unaudited), the guard every test runs under would fail."""
+    capabilities, tab, _, plate, received = orca_app
+    original = uploader.run
+
+    def on_a_thread(job, upload=None):
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(outcome=original(job)))
+        worker.start()
+        worker.join()
+        return result["outcome"]
+
+    monkeypatch.setattr(uploader, "run", on_a_thread)
+    slice_plate(capabilities, plate)
+
+    tab.log_latest()
+
+    assert received  # it "worked", silently
+    assert _audit.unaudited, "the plugin's thread did I/O no prompt covered"
+    assert not any(category == "network" for category, *_ in _audit.audited)
+    _audit.unaudited.clear()  # this test expects the violation; the guard checks every other

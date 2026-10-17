@@ -1,18 +1,20 @@
-"""State the capabilities share: config, the latest slice, and what starts an upload.
+"""State the capabilities share: config, the recent slices, and the log flow the tab drives.
 
-No Orca here: plugin.py and script.py pass in plain values read from Orca, and plugin.py hands
-in the function that pushes a notification.
+No Orca here: plugin.py, page.py and script.py pass in plain values read from Orca.
 
-The latest slice is the one GCodeExportFinished last reported: the plate's temp G-code path,
-the model name and the time. A newer slice replaces it. Its file is not copied when it is
-recorded (that would be I/O on the slicing thread); the background thread copies it when an
-upload starts. That is the file Orca sends: an export to file and a print-host upload both copy
-the same temp G-code, and a re-slice in between replaces both. Each slice is uploaded at most
-once, by the first of: the notification's link, a print-host upload, a Bambu send, the optional
-slicing hook, or the script (which can also log it again on purpose).
+Consent model (see the spec's Decisions): nothing uploads on its own. Lifecycle events and the
+optional hook only record what happened to a slice, on whatever Orca thread raised them, and do
+no I/O except the hook's copy into plugin storage. The I/O that Orca guards with a permission
+prompt (reading the plate's temp G-code, the upload, opening the browser) happens only in
+request_log / finish_log / open_browser / log_latest, which the tab's on_message and the script
+call on Orca's UI thread inside an audited callback. Orca's prompts therefore appear right after
+the user's click, and a "No" is reported in the tab. The plugin starts no thread.
+
+The slices list holds the newest MAX_SLICES slices of this session. A slice is one
+GCodeExportFinished (code Ok): the plate's temp G-code path, the model name and the time. A
+re-slice of the same plate overwrites that file, so it replaces the plate's pending entry.
 """
 
-import functools
 import json
 import logging
 import threading
@@ -20,31 +22,35 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from printlog_orca import presets, staging, triggers, worker
-from printlog_orca.background import Background
-from printlog_orca.triggers import Action
+from printlog_orca import browser, client, install, payload, presets, staging, triggers, uploader
 
 DEFAULT_CONFIG = {
     "template": "default",
-    "open_browser": True,
+    "open_claim_page": "tab",
     "api_base": "https://api.3dprintlog.com",
     "web_base": "https://www.3dprintlog.com",
-    "bambu_send_window_minutes": 30,
     "slice_notification": True,
     "debug": False,
 }
 TEMPLATES = ("default", "full")
+OPEN_MODES = ("tab", "browser")
 PRESET_KEYS = ("print_settings_id", "filament_settings_id", "printer_settings_id")
+MAX_SLICES = 10
+TAB_NAME = "3D Print Log"
+
 # The lifecycle events the plugin acts on; plugin.py ignores the rest unread.
-SLICE_EVENT = "GCodeExportFinished"
-UPLOAD_EVENT = "UploadStarted"
-BAMBU_EVENTS = frozenset({"PrintJobStarted", "PrintStateChanged"})
-WATCHED_EVENTS = frozenset({SLICE_EVENT, UPLOAD_EVENT}) | BAMBU_EVENTS
-# A burst of slices (background slicing while editing) gives one notification, this long after
-# the last one. Also gives a print-host upload, which follows its slice at once, time to log the
-# slice before a notification shows.
-NOTIFY_DELAY_SECONDS = 2.0
-NOTIFICATION_LINK = "Log to 3D Print Log"
+SLICE_EVENT = "GCodeExportFinished"  # slicing thread: record the slice
+SLICE_DONE_EVENT = "SlicingJobComplete"  # UI thread: the after-slice notification
+UPLOAD_EVENT = "UploadStarted"  # print-host queue thread: mark "sent to a print host"
+BAMBU_EVENTS = frozenset({"PrintJobStarted", "SendJobStarted"})  # job worker: "sent to Bambu"
+STATE_EVENT = "PrintStateChanged"  # UI thread: show the notice a Bambu send left
+WATCHED_EVENTS = (
+    frozenset({SLICE_EVENT, SLICE_DONE_EVENT, UPLOAD_EVENT, STATE_EVENT}) | BAMBU_EVENTS
+)
+
+NOT_LOGGED = "not logged"
+UPLOADING = "uploading"
+LOGGED = "logged"
 
 _log = logging.getLogger("printlog_orca")
 
@@ -52,17 +58,16 @@ _log = logging.getLogger("printlog_orca")
 @dataclass(frozen=True)
 class Settings:
     template: str
-    open_browser: bool
+    open_claim_page: str
     api_base: str
     web_base: str
-    bambu_send_window_minutes: float
     slice_notification: bool
     debug: bool
 
 
 def parse_settings(raw):
     """The capability's stored config (a JSON string) over the defaults; a bad value is
-    logged and replaced by its default."""
+    logged and replaced by its default. Keys from earlier versions are ignored."""
     try:
         stored = json.loads(raw) if raw else {}
     except ValueError:
@@ -86,15 +91,11 @@ def parse_settings(raw):
     def is_bool(value):
         return isinstance(value, bool)
 
-    def is_minutes(value):
-        return isinstance(value, int | float) and not isinstance(value, bool) and value >= 0
-
     return Settings(
         template=pick("template", lambda v: v in TEMPLATES),
-        open_browser=pick("open_browser", is_bool),
+        open_claim_page=pick("open_claim_page", lambda v: v in OPEN_MODES),
         api_base=pick("api_base", is_url).rstrip("/"),
         web_base=pick("web_base", is_url).rstrip("/"),
-        bambu_send_window_minutes=pick("bambu_send_window_minutes", is_minutes),
         slice_notification=pick("slice_notification", is_bool),
         debug=pick("debug", is_bool),
     )
@@ -102,255 +103,316 @@ def parse_settings(raw):
 
 @dataclass
 class Slice:
-    """One GCodeExportFinished (code Ok): the identity the dedupe works on. `number` counts
-    slices in this session; a re-slice of the same plate reuses the path but gets a new number."""
-
-    number: int
-    path: str
+    id: int
+    path: str  # the plate's temp G-code
     model_name: str
     sliced_at: float
-    storage_dir: Path
-    settings: Settings
-    uploaded_by: str | None = None  # what uploaded it; None while it has not been
+    destination: str = ""  # "" while not sent; else what the tab shows
+    host: str = triggers.FILE_HOST  # the upload's `host`
+    output_name: str = ""  # an export path, a host file name or a project name
+    copy: Path | None = None  # the hook's copy of the exported file, in storage
+    orca_version: str = ""
+    preset_ids: dict | None = None
+    status: str = NOT_LOGGED
+    status_before: str = NOT_LOGGED  # restored when an upload fails
+    setting_id: str | None = None
+    claim_url: str | None = None
+    message: str = ""
+    error: bool = False
+    replaced: bool = False  # the temp file now holds a newer slice
+    notified: bool = False
+
+    @property
+    def name(self):
+        if self.model_name:
+            return self.model_name
+        name = payload.file_name(self.output_name) if self.output_name else ""
+        return name or "Unnamed plate"
+
+    @property
+    def can_log(self):
+        return self.copy is not None or not self.replaced
 
 
 class Controller:
-    def __init__(
-        self,
-        start_job=None,
-        clock=time.time,
-        background=None,
-        notify_delay=NOTIFY_DELAY_SECONDS,
-    ):
-        # Started here, at import of the shared instance: outside any Orca callback, where
-        # starting a thread is not audited (see background.py).
-        self._background = Background(notify_delay) if background is None else background
-        self._background.start()
-        self._start_job = self._submit_job if start_job is None else start_job
+    def __init__(self, clock=time.time, upload=client.upload):
         self._clock = clock
-        self._started_at = clock()
+        self._upload = upload
+        # Events arrive on several Orca threads; every method holds this only for assignments.
         self._lock = threading.Lock()
-        self._slice = None
+        self._slices = []  # oldest first
         self._count = 0
-        self._push = None
-        self._active = True
-        self._storage_dir = None
-        self._settings = None
-        self._cleaned = False
+        self._config_source = None
+        self._send_notice = None  # the slice id a Bambu send left a notice for
+        self._install_id = None
 
-    # --- wiring (plugin.py) ---------------------------------------------------------------
+    # --- wiring ---------------------------------------------------------------------------
 
-    def set_notifier(self, push):
-        """push(text, hyper_text, on_click): orca.host.ui.push_notification, called only from
-        the background thread."""
-        self._push = push
+    def set_config_source(self, get_config):
+        """get_config() returns the uploader capability's stored config (a JSON string)."""
+        self._config_source = get_config
 
-    def set_active(self, active):
-        """False after on_unload: Orca does not disable a notification's on_click that was
-        pushed from the plugin's own thread (it is bound to an empty plugin key), so a click
-        after unload must do nothing."""
-        self._active = active
+    def settings(self):
+        raw = None
+        if self._config_source is not None:
+            try:
+                raw = self._config_source()
+            except Exception as error:
+                _log.warning("Could not read the plugin config: %s", error)
+        return parse_settings(raw)
 
-    @property
-    def background(self):
-        return self._background
+    # --- events: record only, on any Orca thread ------------------------------------------
 
-    # --- events ---------------------------------------------------------------------------
-
-    def on_slice_finished(self, *, storage_dir, settings, gcode_path, model_name):
-        """GCodeExportFinished with code Ok, on the slicing thread: record it and return. No
-        file access here; the notification is pushed later from the background thread."""
+    def record_slice(self, gcode_path, model_name):
+        """GCodeExportFinished with code Ok, on the slicing thread. No I/O."""
         if not gcode_path:
             return
         with self._lock:
+            for old in self._slices:
+                if _same(old.path, gcode_path):
+                    old.replaced = True
+            self._slices = [
+                s
+                for s in self._slices
+                if not (s.replaced and s.status != LOGGED and s.copy is None)
+            ]
             self._count += 1
-            current = Slice(
-                number=self._count,
-                path=gcode_path,
-                model_name=(model_name or "").strip(),
-                sliced_at=self._clock(),
-                storage_dir=Path(storage_dir),
-                settings=settings,
-            )
-            self._slice = current
-            self._remember(storage_dir, settings)
-        if settings.slice_notification and self._push is not None:
-            self._background.notify_later(functools.partial(self._notify, current.number))
-
-    def on_upload_started(self, *, settings, name):
-        """UploadStarted, on the print-host queue thread: the latest slice is being sent."""
-        upload = self._take_latest("print-host upload")
-        if upload is None:
-            return
-        self._start_latest(
-            upload, settings, host="PrintHost", output_name=triggers.upload_name(name, "")
-        )
-
-    def on_bambu_event(self, *, settings, event_name, msg, name):
-        """PrintJobStarted / PrintStateChanged, on the device thread."""
-        with self._lock:
-            latest = self._slice
-            sliced_at = latest.sliced_at if latest is not None else None
-            action = triggers.for_bambu_event(
-                event_name, msg, sliced_at, self._clock(), settings.bambu_send_window_minutes
-            )
-            if action is not Action.UPLOAD_LATEST or latest.uploaded_by is not None:
-                return
-            latest.uploaded_by = f"Bambu send ({event_name})"
-        # PrintJobStarted carries the project name; PrintStateChanged a device id.
-        candidate = name if event_name == "PrintJobStarted" else ""
-        self._start_latest(
-            latest, settings, host="Bambu", output_name=triggers.upload_name(candidate, "")
-        )
-
-    def on_gcode(
-        self, *, storage_dir, settings, host, gcode_path, output_name, orca_version, preset_ids
-    ):
-        """The optional psGCodePostProcess hook, on the slicing thread. Returns a short message
-        for Orca's log. It copies Orca's file now (Orca removes it after the hook) and stands
-        for the latest slice: the plate just sliced is the one exported or uploaded."""
-        if triggers.for_gcode(host, gcode_path, output_name) is Action.IGNORE:
-            return ""
-        with self._lock:
-            self._remember(storage_dir, settings)
-            latest = self._slice
-            if latest is not None:
-                if latest.uploaded_by is not None:
-                    _log.info(
-                        "Slice %d was logged already (by %s); not logging this %s",
-                        latest.number,
-                        latest.uploaded_by,
-                        "export" if host == triggers.FILE_HOST else "upload",
-                    )
-                    return "3D Print Log: this slice was logged already"
-                latest.uploaded_by = "export" if host == triggers.FILE_HOST else "print-host hook"
-        try:
-            copy = staging.working_copy(storage_dir, gcode_path)
-        except Exception:
-            if latest is not None:
-                with self._lock:
-                    latest.uploaded_by = None  # still loggable through the other paths
-            raise
-        self._start(
-            worker.Job(
-                gcode_path=copy,
-                output_name=output_name,
-                host=host,
-                orca_version=orca_version,
-                preset_ids=dict(preset_ids),
-                **self._job_settings(Path(storage_dir), settings),
-            )
-        )
-        return "3D Print Log: uploading"
-
-    def click(self):
-        """The notification's link, on the UI thread outside any callback. Returns True, which
-        closes the notification. Never raises."""
-        try:
-            if not self._active:
-                return True
-            upload = self._take_latest("notification")
-            if upload is not None:
-                self._start_latest(upload, upload.settings, host="File", output_name="")
-        except Exception:
-            _log.exception("Could not log the slice")
-        return True
-
-    def log_last_slice(self):
-        """The script. Uploads the latest slice even if it was logged already (a deliberate
-        re-log). True if an upload started."""
-        with self._lock:
-            latest = self._slice
-            if latest is None:
-                return False
-            if latest.uploaded_by is not None:
-                _log.info("Logging the last slice again (first logged by %s)", latest.uploaded_by)
-            latest.uploaded_by = latest.uploaded_by or "script"
-            settings = self._settings or latest.settings
-        self._start_latest(latest, settings, host="File", output_name="")
-        return True
-
-    # --- internals ------------------------------------------------------------------------
-
-    def _take_latest(self, reason):
-        """The latest slice, marked uploaded by `reason`; None (logged) if there is none or it
-        was uploaded already."""
-        with self._lock:
-            latest = self._slice
-            if latest is None:
-                _log.info("Nothing to log for the %s: no slice yet in this session", reason)
-                return None
-            if latest.uploaded_by is not None:
-                _log.info(
-                    "Slice %d was logged already (by %s); not logging it again for the %s",
-                    latest.number,
-                    latest.uploaded_by,
-                    reason,
+            self._slices.append(
+                Slice(
+                    id=self._count,
+                    path=gcode_path,
+                    model_name=(model_name or "").strip(),
+                    sliced_at=self._clock(),
                 )
-                return None
-            latest.uploaded_by = reason
-            return latest
+            )
+            del self._slices[:-MAX_SLICES]
 
-    def _notify(self, number):
-        """On the background thread, after the debounce delay."""
+    def mark_sent(self, event_name, name=""):
+        """UploadStarted (print-host queue thread), PrintJobStarted / SendJobStarted (job
+        worker): the latest slice is being sent. Record it; the user logs it from the tab."""
         with self._lock:
-            latest = self._slice
-            if (
-                not self._active
-                or latest is None
-                or latest.number != number
-                or latest.uploaded_by is not None
-                or self._push is None
-            ):
+            latest = self._latest()
+            if latest is None:
                 return
-            text = f"Sliced {latest.model_name or 'the plate'}."
-        try:
-            self._push(text, NOTIFICATION_LINK, self.click)
-        except Exception as error:
-            _log.warning("Could not show the 3D Print Log notification: %s", error)
+            if event_name == UPLOAD_EVENT:
+                # The hook, when a preset lists it, already named the host; the event cannot.
+                if latest.copy is None or latest.host == triggers.FILE_HOST:
+                    latest.destination = "Sent to a print host"
+                    latest.host = "PrintHost"
+            else:
+                latest.destination = "Sent to Bambu"
+                latest.host = "Bambu"
+                # The project name; UploadStarted's name is a temp file and is never used.
+                if latest.copy is None and triggers.upload_name(name, ""):
+                    latest.output_name = name
+                if latest.status != LOGGED:
+                    self._send_notice = latest.id
 
-    def _start_latest(self, latest, settings, *, host, output_name):
-        _log.info("Logging slice %d (%s)", latest.number, latest.uploaded_by)
-        self._start(
-            worker.Job(
-                gcode_path=staging.new_job_path(latest.storage_dir),
-                source_path=Path(latest.path),
-                output_name=triggers.upload_name(output_name, latest.model_name),
-                host=host,
-                orca_version="",
-                preset_ids=None,
-                **self._job_settings(latest.storage_dir, settings),
+    def on_gcode(self, *, storage_dir, host, gcode_path, output_name, orca_version, preset_ids):
+        """The optional psGCodePostProcess hook, on the slicing thread, with Orca's file
+        granted for this call only. Copies it into storage (inside data_dir(): no prompt) so the
+        tab can log the exact file exported or uploaded. No network. Returns a short message."""
+        if triggers.for_gcode(host, gcode_path, output_name) is triggers.Action.IGNORE:
+            return ""
+        copy = staging.export_copy(storage_dir, gcode_path)
+        with self._lock:
+            latest = self._latest()
+            if latest is None:  # enabled after the slice: list the exported file itself
+                self._count += 1
+                latest = Slice(
+                    id=self._count, path=str(copy), model_name="", sliced_at=self._clock()
+                )
+                self._slices.append(latest)
+                del self._slices[:-MAX_SLICES]
+            latest.copy = copy
+            latest.host = host
+            latest.output_name = output_name
+            latest.orca_version = orca_version or ""
+            latest.preset_ids = dict(preset_ids)
+            if host == triggers.FILE_HOST:
+                latest.destination = f"Exported to {payload.file_name(output_name)}"
+            else:
+                latest.destination = f"Sent to {host}"
+            keep = [s.copy for s in self._slices]
+        staging.remove_unreferenced(storage_dir, keep)
+        return "3D Print Log: kept a copy to log from the 3D Print Log tab"
+
+    # --- UI thread ------------------------------------------------------------------------
+
+    def slicing_done(self):
+        """SlicingJobComplete, on the UI thread: the notification text for the latest slice,
+        once per slice, or None."""
+        settings = self.settings()
+        with self._lock:
+            latest = self._latest()
+            if not settings.slice_notification or latest is None or latest.notified:
+                return None
+            latest.notified = True
+            if latest.status == LOGGED:
+                return None
+            return f"Sliced {latest.model_name or 'the plate'}. Open the {TAB_NAME} tab to log it."
+
+    def take_send_notice(self):
+        """PrintStateChanged, on the UI thread: the notice a Bambu send left, once, or None."""
+        settings = self.settings()
+        with self._lock:
+            slice_id, self._send_notice = self._send_notice, None
+            found = self._find(slice_id)
+            if not settings.slice_notification or found is None or found.status == LOGGED:
+                return None
+            return (
+                f"Sent {found.model_name or 'the plate'} to the printer. "
+                f"Open the {TAB_NAME} tab to log it."
             )
+
+    def state(self):
+        """What the tab shows, newest first. JSON-compatible."""
+        settings = self.settings()
+        with self._lock:
+            latest = self._latest()
+            slices = [
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "slicedAt": s.sliced_at,
+                    "destination": s.destination or "Not sent yet",
+                    "status": s.status,
+                    "message": s.message,
+                    "error": s.error,
+                    "claimUrl": s.claim_url,
+                    "canLog": s.can_log,
+                    "latest": s is latest,
+                }
+                for s in reversed(self._slices)
+            ]
+        return {"type": "state", "mode": settings.open_claim_page, "slices": slices}
+
+    def page_ready(self, storage_dir):
+        """The tab (re)loaded: no upload can be waiting on it, and copies of slices no longer
+        listed can go (plugin storage: no prompt)."""
+        with self._lock:
+            for s in self._slices:
+                if s.status == UPLOADING:
+                    s.status = s.status_before
+            keep = [s.copy for s in self._slices]
+        staging.remove_unreferenced(storage_dir, keep)
+
+    def request_log(self, slice_id, relog=False):
+        """The Log button: step one, no I/O. Marks the slice uploading so the page can show it
+        before step two (finish_log) blocks the UI thread."""
+        with self._lock:
+            found = self._find(slice_id)
+            if found is None or not found.can_log:
+                return {
+                    "kind": "missing",
+                    "id": slice_id,
+                    "message": uploader.GONE,
+                }
+            if found.status == UPLOADING:
+                return {"kind": "busy", "id": slice_id}
+            if found.status == LOGGED and not relog:
+                return {"kind": "already_logged", "id": slice_id, "url": found.claim_url}
+            found.status_before = found.status
+            found.status = UPLOADING
+            found.message = "Uploading…"
+            found.error = False
+            return {"kind": "uploading", "id": slice_id}
+
+    def finish_log(self, slice_id, storage_dir):
+        """Step two, on the UI thread in an audited callback: read, upload, and in browser mode
+        open the device page. Blocks until the upload ends (client.TIMEOUT_SECONDS at most)."""
+        settings = self.settings()
+        with self._lock:
+            found = self._find(slice_id)
+            if found is None or found.status != UPLOADING:
+                return {"kind": "missing", "id": slice_id, "message": "Click Log to upload it."}
+            source = found.copy if found.copy is not None else Path(found.path)
+            job_fields = {
+                "gcode_path": source,
+                "output_name": triggers.upload_name(found.output_name, found.model_name),
+                "host": found.host,
+                "orca_version": found.orca_version,
+                "preset_ids": None if found.preset_ids is None else dict(found.preset_ids),
+            }
+        storage_dir = Path(storage_dir)
+        job = uploader.Job(
+            **job_fields,
+            data_dir=presets.data_dir_from_storage(storage_dir),
+            debug_dir=storage_dir / "debug" if settings.debug else None,
+            template=settings.template,
+            api_base=settings.api_base,
+            web_base=settings.web_base,
+            install_id=self.install_id(storage_dir),
         )
+        outcome = uploader.run(job, upload=self._upload)
 
-    def _job_settings(self, storage_dir, settings):
-        return {
-            "data_dir": presets.data_dir_from_storage(storage_dir),
-            "debug_dir": storage_dir / "debug" if settings.debug else None,
-            "template": settings.template,
-            "api_base": settings.api_base,
-            "web_base": settings.web_base,
-            "open_browser": settings.open_browser,
+        with self._lock:
+            if outcome.ok:
+                found.status = LOGGED
+                found.setting_id = outcome.setting_id
+                found.claim_url = outcome.claim_url
+                found.message = ""
+                found.error = False
+                if self._send_notice == found.id:
+                    self._send_notice = None
+            else:
+                found.status = found.status_before
+                found.message = outcome.message
+                found.error = True
+        if not outcome.ok:
+            return {
+                "kind": "failed",
+                "id": slice_id,
+                "message": outcome.message,
+                "declined": outcome.declined,
+            }
+        event = {
+            "kind": "logged",
+            "id": slice_id,
+            "url": outcome.claim_url,
+            "mode": settings.open_claim_page,
         }
+        if settings.open_claim_page == "browser":
+            event["browser"] = self.open_browser(storage_dir)
+        return event
 
-    def _remember(self, storage_dir, settings):
-        """Under the lock. Also clears an earlier session's leftover copies, once, from the
-        background thread."""
-        self._storage_dir = Path(storage_dir)
-        self._settings = settings
-        if not self._cleaned:
-            self._cleaned = True
-            self._background.submit(
-                functools.partial(staging.remove_leftovers, self._storage_dir, self._started_at)
-            )
+    def log_latest(self, storage_dir):
+        """The script: logs the latest slice, again if it was logged already (on purpose).
+        None when there is no slice."""
+        with self._lock:
+            latest = self._latest()
+            slice_id = None if latest is None else latest.id
+        if slice_id is None:
+            return None
+        first = self.request_log(slice_id, relog=True)
+        if first["kind"] != "uploading":
+            return first
+        return self.finish_log(slice_id, storage_dir)
 
-    def _start(self, job):
-        self._start_job(job)
+    def open_browser(self, storage_dir):
+        """The B2 fallback: the device page lists this install's uploads. Its URL never
+        changes, so Orca asks once per install before it opens the browser."""
+        url = browser.device_url(self.settings().web_base, self.install_id(storage_dir))
+        ok, message = browser.open_page(url)
+        return {"kind": "browser", "ok": ok, "message": message, "url": url}
 
-    def _submit_job(self, job):
-        self._background.submit(functools.partial(worker.run, job))
+    def install_id(self, storage_dir):
+        if self._install_id is None:
+            self._install_id = install.install_id(storage_dir)
+        return self._install_id
+
+    # --- internals (under the lock) ---------------------------------------------------------
+
+    def _latest(self):
+        return self._slices[-1] if self._slices else None
+
+    def _find(self, slice_id):
+        return next((s for s in self._slices if s.id == slice_id), None)
 
 
-# The one instance the capabilities share; tests swap it. Created at import, which Orca runs
-# outside any audit context, so its background thread starts without a permission prompt.
+def _same(a, b):
+    return triggers._same_path(a, b)
+
+
+# The one instance the capabilities share; tests swap it. Creating it starts nothing.
 shared = Controller()

@@ -1,15 +1,16 @@
-"""Reads, measures, uploads and opens the browser, on the plugin's background thread.
+"""Reads, measures and uploads one slice, synchronously, when the user asks for it.
 
-That thread has no Orca audit context: orca.host.* is not used here, and every path it needs
-(data_dir, debug folder) comes in the Job. What Orca did not hand over (an upload of the latest
-slice rather than through the slicing hook) is read from the G-code itself: preset names,
-slicer version, and a name from the first object when the slice has no model name.
+Called only from audited callbacks on Orca's UI thread: the 3D Print Log tab's on_message and the
+"Log last slice" script. Orca therefore checks every file read and network call here and shows
+its permission prompt at the moment the user clicked. The plugin starts no thread and does no I/O
+anywhere Orca does not audit.
+
+What Orca did not hand over (no hook ran for this slice) is read from the G-code itself: preset
+names, slicer version, and a name from the first object when the slice has no model name.
 """
 
 import json
 import logging
-import shutil
-import webbrowser
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -24,12 +25,20 @@ from printlog_orca import (
     scrub,
 )
 
+DECLINED = (
+    "Orca blocked the upload because permission was declined. Click Log again to be asked again."
+)
+GONE = (
+    "This slice is gone: Orca removes it when the plate is sliced again or the project closes. "
+    "Slice again to log it."
+)
+
 _log = logging.getLogger("printlog_orca")
 
 
 @dataclass(frozen=True)
 class Job:
-    gcode_path: Path  # a private copy; deleted when the job ends
+    gcode_path: Path  # the plate's temp G-code, or the hook's copy in storage; never modified
     output_name: str  # "" names the upload after the first object
     host: str
     orca_version: str  # "" reads it from the G-code header
@@ -39,43 +48,42 @@ class Job:
     template: str
     api_base: str
     web_base: str
-    open_browser: bool
-    # When set, gcode_path is first copied from here (the plate's temp G-code).
-    source_path: Path | None = None
+    install_id: str
 
 
-def run(job, upload=client.upload, open_url=webbrowser.open):
-    """Never raises: every failure is logged."""
+@dataclass(frozen=True)
+class Outcome:
+    ok: bool
+    message: str
+    setting_id: str | None = None
+    claim_url: str | None = None
+    declined: bool = False  # Orca's prompt was answered No
+
+
+def run(job, upload=client.upload):
+    """Never raises: every failure becomes an Outcome with a message for the tab."""
+    name = payload.file_name(job.output_name) or "the slice"
     try:
-        if job.source_path is not None and not _copy_source(job):
-            return
-        _run(job, upload, open_url)
-    except Exception:
-        _log.exception("Upload of %s failed", payload.file_name(job.output_name) or "the slice")
-    finally:
-        Path(job.gcode_path).unlink(missing_ok=True)
-
-
-def _copy_source(job):
-    try:
-        Path(job.gcode_path).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(job.source_path, job.gcode_path)
-        return True
+        return _run(job, upload)
+    except PermissionError as error:
+        _log.warning("Orca declined a permission for the upload of %s: %s", name, error)
+        return Outcome(False, DECLINED, declined=True)
     except FileNotFoundError:
-        _log.error(
-            "The slice is gone (%s): Orca removes it when the plate is re-sliced or the project "
-            "closes. Slice again to log it.",
-            job.source_path,
-        )
-        return False
+        _log.warning("The slice is gone (%s)", job.gcode_path)
+        return Outcome(False, GONE)
+    except Exception as error:
+        _log.exception("Upload of %s failed", name)
+        return Outcome(False, f"The upload failed: {error}")
 
 
-def _run(job, upload, open_url):
+def _run(job, upload):
     raw = gcode_window.read(job.gcode_path)
     text = scrub.scrub_text(raw)
 
     try:
         bounds = object_bounds.scan_file(job.gcode_path, _log.debug)
+    except PermissionError:
+        raise
     except Exception as error:
         _log.warning("Could not measure the objects in %s: %s", job.gcode_path, error)
         bounds = []
@@ -89,6 +97,8 @@ def _run(job, upload, open_url):
     if job.data_dir is not None:
         try:
             user_presets = presets.find(job.data_dir, *_ids(preset_ids), _log.info)
+        except PermissionError:
+            raise
         except Exception as error:
             _log.warning("Could not read the user presets: %s", error)
 
@@ -98,6 +108,7 @@ def _run(job, upload, open_url):
         output_name=output_name,
         host=job.host,
         template=job.template,
+        install_id=job.install_id,
         bounds=bounds,
         user_presets=user_presets,
     )
@@ -109,16 +120,14 @@ def _run(job, upload, open_url):
         url = client.new_print_url(job.web_base, orca_version, __version__, result.setting_id)
         _log.info("Uploaded %s to 3D Print Log (setting %s)", name, result.setting_id)
     else:
-        _log.error("Upload of %s to 3D Print Log failed: %s", name, result.message)
+        _log.warning("Upload of %s to 3D Print Log failed: %s", name, result.message)
 
     if job.debug_dir is not None:
         _write_debug(job.debug_dir, metadata, len(text), result, url)
 
-    if url and job.open_browser:
-        try:
-            open_url(url)
-        except Exception as error:
-            _log.warning("Could not open the browser at %s: %s", url, error)
+    if not result.ok:
+        return Outcome(False, f"The upload failed: {result.message}")
+    return Outcome(True, "Logged", setting_id=result.setting_id, claim_url=url)
 
 
 def _ids(preset_ids):

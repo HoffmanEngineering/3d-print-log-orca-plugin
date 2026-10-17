@@ -1,16 +1,20 @@
 """The OrcaSlicer side: the package class and the uploader capability.
 
 Zero setup: once the plugin is enabled, Orca sends every lifecycle event to the uploader, for
-every printer and profile. The uploader watches four:
-- GCodeExportFinished (slicing thread): records the latest slice; a notification with a
-  "Log to 3D Print Log" link follows from the plugin's background thread.
-- UploadStarted (print-host queue thread): logs the latest slice.
-- PrintJobStarted / PrintStateChanged (device threads): Bambu sends.
-execute() is the optional psGCodePostProcess hook, for presets that list it: an export to file
-then uploads by itself.
+every printer and profile. Events only record what happened to a slice; nothing uploads until the
+user clicks Log in the 3D Print Log tab (page.py) or runs the script (script.py), so Orca's
+permission prompts come at that click. The uploader watches:
+- GCodeExportFinished (slicing thread): records the slice. No I/O.
+- SlicingJobComplete (UI thread): the "Sliced <model>" notification.
+- UploadStarted (print-host queue thread), PrintJobStarted / SendJobStarted (job worker): marks
+  the latest slice sent. No I/O.
+- PrintStateChanged (UI thread): shows the notice a Bambu send left.
+execute() is the optional psGCodePostProcess hook, for presets that list it: it copies the
+exported file into plugin storage (Orca grants its folder for the call), so the tab logs that
+exact file. No network.
 
-Nothing here may raise into Orca, fail the slice, start a thread, or call orca.host.ui: these
-callbacks run on Orca's own threads, inside an audit context (see background.py).
+Nothing here may raise into Orca, fail the slice, start a thread, or call orca.host.ui off the UI
+thread.
 """
 
 import logging
@@ -18,7 +22,8 @@ import sys
 
 import orca
 
-from printlog_orca import controller
+from printlog_orca import controller, page
+from printlog_orca.page import PrintLogPage
 from printlog_orca.script import LogLastSlice
 
 _log = logging.getLogger("printlog_orca")
@@ -41,16 +46,12 @@ if not any(isinstance(h, _StderrHandler) for h in _log.handlers):
     _log.propagate = False
 
 
-def push_notification(text, hyper_text, on_click):
-    """Called only from the plugin's background thread, never from an Orca callback: the call
-    blocks until the UI thread shows it."""
+def push_notification(text):
+    """Only from a callback on the UI thread (orca.host.ui blocks until the UI thread runs it).
+    Plain text, no link: a link's on_click runs outside any audit context, so it must not do
+    the upload, and Python cannot bring the tab forward."""
     ui = orca.host.ui
-    ui.push_notification(
-        ui.NotificationLevel.RegularNotificationLevel,
-        text,
-        hyper_text=hyper_text,
-        on_click=on_click,
-    )
+    ui.push_notification(ui.NotificationLevel.RegularNotificationLevel, text)
 
 
 class PrintLogUploader(orca.slicing.SlicingPipelineCapabilityBase):
@@ -61,25 +62,15 @@ class PrintLogUploader(orca.slicing.SlicingPipelineCapabilityBase):
         return dict(controller.DEFAULT_CONFIG)
 
     def on_load(self):
-        try:
-            controller.shared.set_notifier(push_notification)
-            controller.shared.set_active(True)
-        except Exception:
-            _log.exception("Could not start the 3D Print Log uploader")
-
-    def on_unload(self):
-        try:
-            controller.shared.set_active(False)
-        except Exception:
-            _log.exception("Could not stop the 3D Print Log uploader")
+        controller.shared.set_config_source(self.get_config)
 
     def execute(self, ctx):
         if ctx.step != orca.slicing.Step.psGCodePostProcess:
             return orca.ExecutionResult.skipped()
         try:
+            controller.shared.set_config_source(self.get_config)
             message = controller.shared.on_gcode(
                 storage_dir=orca.host.plugin.storage(),
-                settings=controller.parse_settings(self.get_config()),
                 host=ctx.host,
                 gcode_path=ctx.gcode_path,
                 output_name=ctx.output_name,
@@ -88,16 +79,17 @@ class PrintLogUploader(orca.slicing.SlicingPipelineCapabilityBase):
             )
             return orca.ExecutionResult.success(message)
         except Exception:
-            _log.exception("Could not prepare the upload of %s", ctx.output_name)
-            return orca.ExecutionResult.success("3D Print Log: not uploaded after an error")
+            _log.exception("Could not keep a copy of %s", ctx.output_name)
+            return orca.ExecutionResult.success("3D Print Log: no copy kept after an error")
 
     def on_lifecycle_event(self, event, ctx):
         # Every event of every kind reaches every capability, on the raising thread: return
-        # fast for the ones that cannot start an upload.
+        # fast for the ones the plugin does not watch.
         name = getattr(event, "name", "")
         if name not in controller.WATCHED_EVENTS:
             return
         try:
+            controller.shared.set_config_source(self.get_config)
             self._on_event(name, ctx)
         except Exception:
             _log.exception("Could not handle %s", name)
@@ -106,33 +98,31 @@ class PrintLogUploader(orca.slicing.SlicingPipelineCapabilityBase):
         shared = controller.shared
         if name == controller.SLICE_EVENT:
             # ctx.msg is the temp G-code path, or "path\n<error>" with an Error code.
-            if ctx.code != orca.LifecycleEvtCode.Ok:
-                return
-            shared.on_slice_finished(
-                storage_dir=orca.host.plugin.storage(),
-                settings=controller.parse_settings(self.get_config()),
-                gcode_path=ctx.msg,
-                model_name=ctx.name,
-            )
-        elif name == controller.UPLOAD_EVENT:
-            shared.on_upload_started(
-                settings=controller.parse_settings(self.get_config()), name=ctx.name
-            )
+            if ctx.code == orca.LifecycleEvtCode.Ok:
+                shared.record_slice(ctx.msg, ctx.name)
+        elif name == controller.SLICE_DONE_EVENT:
+            if ctx.code == orca.LifecycleEvtCode.Ok:
+                self._notify(shared.slicing_done())
+        elif name == controller.STATE_EVENT:
+            self._notify(shared.take_send_notice())
         else:
-            shared.on_bambu_event(
-                settings=controller.parse_settings(self.get_config()),
-                event_name=name,
-                msg=ctx.msg,
-                name=ctx.name,
-            )
+            shared.mark_sent(name, ctx.name)
+
+    @staticmethod
+    def _notify(text):
+        """On the UI thread (SlicingJobComplete, PrintStateChanged)."""
+        if not text:
+            return
+        page.refresh()
+        try:
+            push_notification(text)
+        except Exception as error:
+            _log.warning("Could not show the 3D Print Log notification: %s", error)
 
 
 @orca.plugin
 class PrintLogPlugin(orca.base):
     def register_capabilities(self):
         orca.register_capability(PrintLogUploader)
+        orca.register_capability(PrintLogPage)
         orca.register_capability(LogLastSlice)
-
-
-# Set at import too, in case Orca does not call on_load before the first event.
-controller.shared.set_notifier(push_notification)

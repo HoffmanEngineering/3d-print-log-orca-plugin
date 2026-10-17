@@ -13,13 +13,17 @@ MAX_MODELS = 1000
 MAX_USER_PRESETS = 64
 
 
-def metadata(*, plugin_version, slicer_version, output_name, host, template, bounds, user_presets):
+def metadata(
+    *, plugin_version, slicer_version, output_name, host, template, install_id, bounds, user_presets
+):
     return {
         "pluginVersion": plugin_version,
         "slicerVersion": slicer_version,
         "outputName": file_name(output_name),
         "host": host,
         "template": template,
+        # This install's id (install.py): the browser fallback lists the uploads that carry it.
+        "installId": install_id,
         # Raw centerline bounds; the server adds the outer-wall line width, as ModelsPlaceholder.
         "models": [
             {

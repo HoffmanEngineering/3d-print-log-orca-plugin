@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from orca import _audit, _callback
 
 from printlog_orca import client
 
@@ -172,3 +173,22 @@ def test_new_print_url():
 
 def test_response_body_is_valid_json_in_the_fixture():
     assert json.loads(Api().body)["newSettingId"]
+
+
+def test_a_declined_request_prompt_raises_permission_error(api):
+    _audit.answer = lambda category, target: False
+
+    with _callback.inside("ui"), pytest.raises(PermissionError):
+        upload(api)
+    assert api.requests == []
+
+
+def test_a_declined_connection_prompt_raises_permission_error_not_a_network_failure(api):
+    # The URL was allowed in an earlier session; this session asks for the host again
+    # (http.client.connect), and urllib wraps that refusal in a URLError.
+    _audit.granted.add(("network", api.base + client.UPLOAD_PATH))
+    _audit.answer = lambda category, target: False
+
+    with _callback.inside("ui"), pytest.raises(PermissionError):
+        upload(api)
+    assert api.requests == []

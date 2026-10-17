@@ -1,4 +1,9 @@
-"""POSTs an upload to the API and builds the browser's new-print URL."""
+"""POSTs an upload to the API and builds the claim page's URL.
+
+Runs on Orca's UI thread inside an audited callback, so Orca's own permission prompts appear while
+it connects. A declined prompt is raised as PermissionError (never reported as a network failure),
+so the tab can say what happened and that clicking again asks again.
+"""
 
 import json
 import urllib.error
@@ -42,16 +47,21 @@ def upload(api_base, body, content_type, timeout=TIMEOUT_SECONDS):
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status, raw = response.status, response.read()
+    except PermissionError:
+        raise  # Orca's audit hook: the user declined the prompt
     except urllib.error.HTTPError as error:
         with error:
             return _failure(error.code, error.read(), error.headers.get("Retry-After"))
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, PermissionError):
+            raise error.reason from None  # declined while connecting; urllib wraps OSErrors
+        return UploadResult(False, None, f"could not reach {api_base}: {error.reason}")
     except TimeoutError:
         return UploadResult(
             False, None, f"no answer from {api_base} within {timeout} s (timed out)"
         )
-    except (urllib.error.URLError, OSError) as error:
-        reason = getattr(error, "reason", error)
-        return UploadResult(False, None, f"could not reach {api_base}: {reason}")
+    except OSError as error:
+        return UploadResult(False, None, f"could not reach {api_base}: {error}")
 
     setting_id = _setting_id(raw)
     if status != 200 or setting_id is None:

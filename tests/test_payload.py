@@ -29,6 +29,7 @@ def make_metadata(**overrides):
         "output_name": "3DBenchy_PLA_1h2m.gcode",
         "host": "File",
         "template": "default",
+        "install_id": "0123456789abcdef0123456789abcdef",
         "bounds": [],
         "user_presets": [],
     }
@@ -48,6 +49,7 @@ def test_metadata_has_the_contract_fields():
         "outputName": "3DBenchy_PLA_1h2m.gcode",
         "host": "File",
         "template": "default",
+        "installId": "0123456789abcdef0123456789abcdef",
         "models": [
             {
                 "name": "3DBenchy.stl",
