@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import webbrowser
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,32 @@ import pytest
 # The fake `orca` module stands in for OrcaSlicer's embedded one.
 sys.path.insert(0, str(Path(__file__).parent / "fake_orca"))
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+import orca_driver  # noqa: E402
+from orca import _audit  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def browser(monkeypatch):
+    """No test opens a real browser: webbrowser.open behaves as on Windows and records URLs."""
+    fake = orca_driver.Browser()
+    monkeypatch.setattr(webbrowser, "open", fake)
+    return fake
+
+
+@pytest.fixture(autouse=True)
+def audit_guard():
+    """Fails a test in which the plugin did I/O outside an audit context (a thread it started, a
+    notification's on_click, import): that skips the user's consent."""
+    _audit.reset()
+    yield
+    try:
+        if _audit.strict:
+            assert _audit.unaudited == [], (
+                f"plugin I/O outside an audit context: {_audit.unaudited}"
+            )
+    finally:
+        _audit.reset()
 
 
 @pytest.fixture

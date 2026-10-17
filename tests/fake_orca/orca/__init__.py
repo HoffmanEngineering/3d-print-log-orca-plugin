@@ -195,7 +195,7 @@ def request_permissions(fs_read=()):
 
 
 # Submodules, bound as attributes the way pybind11's def_submodule does.
-from orca import host, script, slicing  # noqa: E402
+from orca import host, pages, script, slicing  # noqa: E402
 
 __all__ = [
     "ExecutionResult",
@@ -210,6 +210,7 @@ __all__ = [
     "_callback",
     "base",
     "host",
+    "pages",
     "plugin",
     "register_capability",
     "request_permissions",
