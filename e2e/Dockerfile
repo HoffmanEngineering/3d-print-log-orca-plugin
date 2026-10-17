@@ -6,7 +6,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
         ca-certificates curl jq python3 \
-        xvfb openbox xdotool x11-utils imagemagick \
+        xvfb openbox xdotool x11-utils imagemagick tesseract-ocr\
         mesa-utils libgl1-mesa-dri libegl1 libglu1-mesa \
         libgtk-3-0 libwebkit2gtk-4.1-0 libsoup-3.0-0 \
         libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 libgstreamer-gl1.0-0 \

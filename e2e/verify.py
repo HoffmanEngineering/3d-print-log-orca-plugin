@@ -1,10 +1,11 @@
 """Checks the API side of an e2e run: the CuraSettings rows the uploads created.
 
-Reads <out>/results.tsv (scenario, expected, uploads, setting ids) written by scripts/e2e.sh,
-queries SQL Server in its Docker container for the rows created since the run started, and
-checks that each uploaded setting id is stored with a note, print time, filament usage,
-file and print name and a snapshot. Decodes each snapshot to <out>/snapshot-<scenario>.png and
-writes <out>/api-rows.json. Exit code: the number of failed checks.
+Reads <out>/results.tsv (session, expected, uploads, setting ids, prompts) written by
+scripts/e2e.sh, queries SQL Server in its Docker container for the rows created since the run
+started, and checks that each uploaded setting id is stored with a note, print time, filament
+usage with a weight, file and print name, the 20 mm cube's size in the note and a snapshot.
+Decodes each snapshot to <out>/snapshot-<session>.png and writes <out>/api-rows.json.
+Exit code: the number of failed checks.
 
     python -I e2e/verify.py --out e2e/out --since 2026-10-17T16:00:00Z
 """
@@ -99,7 +100,7 @@ def main():
         ids = [i.lower() for i in (ids[0].split(",") if ids and ids[0] else [])]
         check(
             len(ids) == int(expected),
-            f"scenario {scenario}: {expected} browser URL(s) with a settingId, got {len(ids)}",
+            f"scenario {scenario}: {expected} upload(s) logged with a setting id, got {len(ids)}",
         )
         for setting_id in ids:
             row = by_id.get(setting_id)
@@ -118,6 +119,14 @@ def main():
             )
             amounts = [(u.get("estimatedLengthInM"), u.get("estimatedAmountMg")) for u in usage]
             check(bool(usage), f"scenario {scenario}: filament usage (m, mg) {amounts}")
+            check(
+                any((mg or 0) > 0 for _m, mg in amounts),
+                f"scenario {scenario}: an estimated weight in grams",
+            )
+            check(
+                "20.0 × 20.0 × 20.0 mm" in (s.get("note") or ""),
+                f"scenario {scenario}: the note lists the cube as 20.0 x 20.0 x 20.0 mm",
+            )
             check(
                 bool(s.get("file_name")), f"scenario {scenario}: file_name {s.get('file_name')!r}"
             )

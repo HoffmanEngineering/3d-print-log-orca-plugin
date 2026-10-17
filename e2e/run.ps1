@@ -15,17 +15,17 @@
 .EXAMPLE
     .\e2e\run.ps1
     .\e2e\run.ps1 -FreshWizard          # run Orca's first-run wizard instead of the cached datadir
-    .\e2e\run.ps1 -PromptAnswer yes     # answer Yes to any plugin permission prompt
+    .\e2e\run.ps1 -PromptAnswer no      # answer No to every plugin permission prompt
     .\e2e\run.ps1 -Mode permissions     # the prompt spike with variants/permission_probe.py (answers Yes)
 #>
 param(
     [string]$OrcaTag = "v2.5.0-alpha",
     [string]$AppImage = "OrcaSlicer_Linux_AppImage_Ubuntu2404_V2.5.0-alpha.AppImage",
     [int]$ApiPort = 5101,
-    [string]$WebBase = "http://localhost:4310",
+    [string]$WebBase = "http://localhost:4320",
     [string]$SqlContainer = "3d-print-log-api-sqlserver-1",
     [string]$Database = "PrintLogDb_OrcaE2E",
-    [ValidateSet("no", "yes")][string]$PromptAnswer = "no",
+    [ValidateSet("no", "yes")][string]$PromptAnswer = "yes",
     [ValidateSet("scenarios", "permissions")][string]$Mode = "scenarios",
     [switch]$FreshWizard
 )
@@ -77,6 +77,7 @@ docker rm -f $name 2>$null | Out-Null
 # Files go in and out with docker cp: no bind mounts, so no Docker Desktop file-sharing prompts.
 docker create --name $name --add-host=host.docker.internal:host-gateway `
     -e API_BASE="http://host.docker.internal:$ApiPort" -e WEB_BASE=$WebBase -e PROMPT_ANSWER=$PromptAnswer -e MODE=$Mode `
+    -e FORWARD_PORTS="$(([uri]$WebBase).Port) $ApiPort" `
     $image | Out-Null
 docker cp $wheel "${name}:/in/3d-print-log.whl"
 $snapshot = Join-Path $cache "datadir-after-wizard.tgz"
@@ -84,7 +85,7 @@ if (-not $FreshWizard -and (Test-Path $snapshot)) { docker cp $snapshot "${name}
 docker cp (Join-Path $e2e "scripts\.") "${name}:/e2e/"
 docker cp (Join-Path $e2e "variants") "${name}:/e2e/variants"
 
-Write-Host "Running ($Mode, about 6 minutes)"
+Write-Host "Running ($Mode, about 12 minutes)"
 docker start -a $name
 $exit = $LASTEXITCODE
 if ($Mode -eq "permissions") {
