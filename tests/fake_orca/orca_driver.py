@@ -14,6 +14,7 @@ from pathlib import Path
 
 import orca
 from orca import _audit, _callback
+from orca.host import app as host_app
 from orca.host import plugin as host_plugin
 from orca.host import ui
 
@@ -40,6 +41,7 @@ def reset(storage_dir):
     """A fresh Orca: no config, no notifications, no grants; strict audit tracking on."""
     orca._stored_configs.clear()
     ui.reset()
+    host_app.reset()
     _audit.reset()
     _audit.strict = True
     host_plugin.storage_dir = storage_dir
@@ -74,7 +76,9 @@ def execute(capability, ctx):
 def run_script(capability):
     """Plugins dialog -> Run, on the UI thread."""
     with _callback.inside("ui"):
-        return capability.execute()
+        result = capability.execute()
+    ui.run_pending()
+    return result
 
 
 def fire(capabilities, event, ctx, thread=None):
@@ -84,6 +88,7 @@ def fire(capabilities, event, ctx, thread=None):
     for capability in capabilities.values():
         with _callback.inside(kind):
             capability.on_lifecycle_event(event, ctx)
+    ui.run_pending()
 
 
 def click(notification):
@@ -133,6 +138,7 @@ class Page:
         decoded = json.loads(json.dumps(data))
         with _callback.inside("ui"):
             self.capability.on_message(decoded)
+        ui.run_pending()
         return self.inbox[before:]
 
     def close(self):
@@ -156,3 +162,21 @@ class Browser:
             return False
         self.opened.append(url)
         return True
+
+
+def window_message(window, data):
+    """The window's page calls window.orca.postMessage(data): on_message on the UI thread, outside
+    any audit context (PluginHostUi's message adapter runs without a plugin scope)."""
+    assert window.open, "the window is closed"
+    decoded = json.loads(json.dumps(data))
+    if window.on_message is not None:
+        with _callback.inside(None):
+            window.on_message(decoded)
+    ui.run_pending()
+
+
+def close_window(window, by="user"):
+    """The user closes the window (its close box), or its page calls window.orca.close(): either
+    way WebDialog fires on_close once, outside any audit context."""
+    window._finish(by)
+    ui.run_pending()

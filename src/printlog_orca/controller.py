@@ -26,14 +26,17 @@ from printlog_orca import browser, client, install, payload, presets, staging, t
 
 DEFAULT_CONFIG = {
     "template": "default",
-    "open_claim_page": "tab",
+    "open_claim_page": "window",
     "api_base": "https://api.3dprintlog.com",
     "web_base": "https://www.3dprintlog.com",
     "slice_notification": True,
     "debug": False,
 }
 TEMPLATES = ("default", "full")
-OPEN_MODES = ("tab", "browser")
+# "window": the claim page in an OrcaSlicer window; "browser": this install's uploads page in
+# the system browser. "tab" is what 0.1.0 called the first one.
+OPEN_MODES = ("window", "browser")
+OPEN_MODE_ALIASES = {"tab": "window"}
 PRESET_KEYS = ("print_settings_id", "filament_settings_id", "printer_settings_id")
 MAX_SLICES = 10
 TAB_NAME = "3D Print Log"
@@ -51,6 +54,7 @@ WATCHED_EVENTS = (
 NOT_LOGGED = "not logged"
 UPLOADING = "uploading"
 LOGGED = "logged"
+UNNAMED = "your plate"
 
 _log = logging.getLogger("printlog_orca")
 
@@ -76,8 +80,10 @@ def parse_settings(raw):
     if not isinstance(stored, dict):
         stored = {}
 
-    def pick(key, valid):
+    def pick(key, valid, aliases=None):
         value = stored.get(key, DEFAULT_CONFIG[key])
+        if aliases and isinstance(value, str):
+            value = aliases.get(value, value)
         if valid(value):
             return value
         _log.warning(
@@ -93,7 +99,7 @@ def parse_settings(raw):
 
     return Settings(
         template=pick("template", lambda v: v in TEMPLATES),
-        open_claim_page=pick("open_claim_page", lambda v: v in OPEN_MODES),
+        open_claim_page=pick("open_claim_page", lambda v: v in OPEN_MODES, OPEN_MODE_ALIASES),
         api_base=pick("api_base", is_url).rstrip("/"),
         web_base=pick("web_base", is_url).rstrip("/"),
         slice_notification=pick("slice_notification", is_bool),
@@ -105,8 +111,9 @@ def parse_settings(raw):
 class Slice:
     id: int
     path: str  # the plate's temp G-code
-    model_name: str
+    model_name: str  # GCodeExportFinished's ctx.name; empty for an STL project
     sliced_at: float
+    display_name: str = ""  # from the project or its objects, for the tab and notifications only
     destination: str = ""  # "" while not sent; else what the tab shows
     host: str = triggers.FILE_HOST  # the upload's `host`
     output_name: str = ""  # an export path, a host file name or a project name
@@ -123,11 +130,17 @@ class Slice:
     notified: bool = False
 
     @property
+    def label(self):
+        """The name notifications use."""
+        return self.model_name or self.display_name or UNNAMED
+
+    @property
     def name(self):
-        if self.model_name:
-            return self.model_name
+        """What the tab lists it as."""
+        if self.model_name or self.display_name:
+            return self.model_name or self.display_name
         name = payload.file_name(self.output_name) if self.output_name else ""
-        return name or "Unnamed plate"
+        return name or UNNAMED.capitalize()
 
     @property
     def can_log(self):
@@ -239,18 +252,30 @@ class Controller:
 
     # --- UI thread ------------------------------------------------------------------------
 
-    def slicing_done(self):
+    def slicing_done(self, display_name=""):
         """SlicingJobComplete, on the UI thread: the notification text for the latest slice,
-        once per slice, or None."""
+        once per slice, or None. display_name is what Orca's project calls the plate (its saved
+        name, or its objects), for a slice whose event carried no name. It names the slice in
+        the tab and in notifications only; the upload is named from the G-code."""
         settings = self.settings()
         with self._lock:
             latest = self._latest()
-            if not settings.slice_notification or latest is None or latest.notified:
+            if latest is None:
+                return None
+            if not latest.display_name:
+                latest.display_name = (display_name or "").strip()
+            if not settings.slice_notification or latest.notified:
                 return None
             latest.notified = True
             if latest.status == LOGGED:
                 return None
-            return f"Sliced {latest.model_name or 'the plate'}. Open the {TAB_NAME} tab to log it."
+            return f"Sliced {latest.label}. Open the {TAB_NAME} tab to log it."
+
+    def needs_display_name(self):
+        """True when the latest slice has no name of its own yet."""
+        with self._lock:
+            latest = self._latest()
+            return latest is not None and not (latest.model_name or latest.display_name)
 
     def take_send_notice(self):
         """PrintStateChanged, on the UI thread: the notice a Bambu send left, once, or None."""
@@ -260,10 +285,7 @@ class Controller:
             found = self._find(slice_id)
             if not settings.slice_notification or found is None or found.status == LOGGED:
                 return None
-            return (
-                f"Sent {found.model_name or 'the plate'} to the printer. "
-                f"Open the {TAB_NAME} tab to log it."
-            )
+            return f"Sent {found.label} to the printer. Open the {TAB_NAME} tab to log it."
 
     def state(self):
         """What the tab shows, newest first. JSON-compatible."""
@@ -375,6 +397,12 @@ class Controller:
         if settings.open_claim_page == "browser":
             event["browser"] = self.open_browser(storage_dir)
         return event
+
+    def claim_url(self, slice_id):
+        """The claim page of a logged slice, or None."""
+        with self._lock:
+            found = self._find(slice_id)
+            return None if found is None or found.status != LOGGED else found.claim_url
 
     def log_latest(self, storage_dir):
         """The script: logs the latest slice, again if it was logged already (on purpose).

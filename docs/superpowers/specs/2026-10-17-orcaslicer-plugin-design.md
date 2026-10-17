@@ -2,7 +2,8 @@
 
 Date: 2026-10-17. Status: approved in chat, building. Revised the same day twice: first to a zero-setup design with
 no preset step, then to the consent design (A2 + B4, with B2 as the browser fallback): every upload starts from a
-click and runs where Orca asks the user first.
+click and runs where Orca asks the user first. Revised after the first 2.5.0-alpha e2e run: the claim page opens in an
+OrcaSlicer window instead of in the tab, which could not come back from it.
 
 ## Goal
 
@@ -79,7 +80,23 @@ labeled experimental and may change. `PAM` = `src/slic3r/plugin/PluginAuditManag
   `window.orca` bridge injected as a user script into **every top-level document** (`PluginPages.cpp:43-76`), so a
   remote page navigated to inside the tab gets it too. A new-window request loads in the tab itself
   (`PluginPages.cpp:132-138`). There is no CSP or navigation filter. There is no Python API to select the tab
-  (only the speed-dial action does, `ActionRegistry.cpp:184`) or to navigate it.
+  (only the speed-dial action does, `ActionRegistry.cpp:184`) or to navigate it. **Once the tab has navigated away,
+  it cannot come back** (2.5.0-alpha e2e run): Back from a remote page lands on a blank first history entry with
+  Back greyed out, and neither reload nor switching tabs restores the list; only a restart does.
+- **HTML windows** (`orca.host.ui.create_window(html, title="OrcaSlicer", width=820, height=600, on_message=None,
+  on_close=None, style=WINDOW_MODELESS, on_submit=None)`, `host/PluginHostUi.cpp:342-408`): a `WebDialog`
+  (`WebDialog.cpp`) parented to the main window, modeless (`use_normal_window_type`, resizable, maximizable) or
+  `WINDOW_MODAL`. It takes **HTML only, no URL**: a bundled bootstrap page loads first, then `SetPage(html,
+  file:///<resources>/web/)`. It returns a live `UiWindow` handle (`post`, `close`, `is_open`) at once and defers
+  building the dialog to a `CallAfter`, so it neither waits nor nests webview creation inside a script-message
+  callback: safe to call from a Pages `on_message`. Orca's `window.orca` bridge (`postMessage`, `submit`, `close`,
+  `onMessage`, `WebHosting.cpp:21-45`) is a document-start user script for every top-level document of that
+  webview, so a remote page the window navigates to can call `window.orca.close()`. `on_message` and `on_close` run
+  on the UI thread **outside any audit context** (the adapters hold no plugin scope); `on_close` fires once, for a
+  close by the user, by `window.orca.close()` or by `handle.close()` (all `CallAfter`-marshaled), not on plugin
+  teardown. Its webview comes from the same `WebView::CreateWebView` as the tab's (`WebView.cpp:313-414`), and Orca
+  configures no data folder or profile for any of them, so per wx 3.3.2's defaults (one WebView2 user data folder
+  per process; WebKitGTK's default web context) the window shares the tab's cookies and session.
 - **The audit hook** (`PAM`) is active only while `current_plugin()` (a `thread_local`) is set, which only Orca's
   trampolines do, for the length of a call into the plugin. Inside one:
   - File events are allowed without a prompt inside `data_dir()` (read/write), `resources_dir()` (read) and the
@@ -128,13 +145,16 @@ labeled experimental and may change. `PAM` = `src/slic3r/plugin/PluginAuditManag
      the temp G-code and POST. Lifecycle events on worker threads (`GCodeExportFinished`, `UploadStarted`,
      `PrintJobStarted`, `SendJobStarted`) only record. The UI-thread events (`SlicingJobComplete`,
      `PrintStateChanged`) could upload but would pop a modal prompt out of nowhere when a printer starts, so they only
-     notify. The plugin starts no thread, and does no I/O in import, `on_click` or window `on_message`.
+     notify. The plugin starts no thread, and does no I/O in import, `on_click` or a window's `on_message` and
+     `on_close`.
      Rejected: A1 (the old thread: a bypass), A3 (retry after the async prompt: urllib never passes off the UI
      thread), A4 (ride the session-wide cascade from a thread: relies on behavior the wiki says it does not have),
      ctypes and writing our own `.install_state.json` (bypasses).
-   - **B4: a "3D Print Log" Pages tab.** It lists the recent slices with Log buttons, and after a log it navigates
-     itself to the claim page inside Orca: no browser launch, so no process prompt and no setting id in a dialog.
-     An iframe would not work (3dprintlog.com sends `X-Frame-Options: DENY`).
+   - **B4: a "3D Print Log" Pages tab, and the claim page in an OrcaSlicer window.** The tab lists the recent
+     slices with Log buttons; after a log the plugin opens the claim page in an OrcaSlicer window
+     (`orca.host.ui.create_window`): no browser launch, so no process prompt and no setting id in a dialog. The tab
+     itself never navigates, because it cannot come back (see the Pages notes). An iframe would not work
+     (3dprintlog.com sends `X-Frame-Options: DENY`).
    - **B2: Open in browser**, for users who prefer their own browser or cannot sign in inside Orca (Google may refuse
      an embedded webview). It opens `{web_base}/prints/new/orca?device=<installId>`, which lists this install's
      uploads waiting to be claimed. The URL is the same every time, so Orca's "run the following command" prompt is
@@ -170,7 +190,9 @@ Package `printlog_orca`:
 |---|---|
 | `plugin.py` | `@orca.plugin` class and the `PrintLogUploader` capability (`SlicingPipelineCapabilityBase`): `on_lifecycle_event` (record, notify), the optional `execute` hook, default config, the `push_notification` wrapper. |
 | `page.py` | `PrintLogPage` (`PagesPluginCapabilityBase`), the "3D Print Log" tab: `get_ui`, the `on_message` protocol, `refresh()` for UI-thread callers. |
-| `page_html.py` | The tab's HTML and script, inline, themed with Orca's CSS variables. |
+| `page_html.py` | The tab's HTML and script, inline, themed with Orca's CSS variables, with a footer per mode. It sets no location, and disarms links and `window.open`. |
+| `claim_window.py` | The claim page in an OrcaSlicer window: `create_window` with HTML that goes on to the claim URL; one window at a time; closes it when Back returns to that HTML; refreshes the tab on close. |
+| `plate.py` | The display name for a slice whose event had no name: the saved project's name, else its objects' names, from Orca's model in memory. |
 | `script.py` | `LogLastSlice` script capability: logs the latest slice, again if it was logged. |
 | `controller.py` | State the capabilities share, without `orca`: config, the recent slices, the log flow (`request_log`, `finish_log`, `open_browser`, `log_latest`), notification texts. |
 | `uploader.py` | One synchronous upload: read the window, scan bounds, collect presets, scrub, POST. Returns an outcome (claim URL, API message, or "declined"). |
@@ -205,42 +227,54 @@ a logged one stays (with its claim link) but can no longer be logged, since its 
 
 #### The tab and its message protocol
 
-Every page message carries a per-session token embedded in the HTML; the plugin ignores messages without it. After
-the tab navigates to the claim page, that remote page (and anything it links to) also gets `window.orca` and could
-post to `on_message`, but it cannot read the token.
+Every page message carries a per-session token embedded in the HTML; the plugin ignores messages without it. The
+tab never shows a remote page, but any page Orca shows gets a `window.orca`; none of them can read the token.
 
 | Page sends | Plugin does (UI thread, audited) | Replies `{type: "state", mode, slices, event}` with `event` |
 |---|---|---|
-| `ready` (load, reload, Back) | resets a slice left `uploading`, removes unreferenced copies | none |
+| `ready` (load, reload) | resets a slice left `uploading`, removes unreferenced copies | none |
 | `refresh` (visible again, 5 s poll) | nothing | none |
 | `log {id, relog}` | no I/O: marks the slice `uploading` | `uploading`, or `already_logged {url}`, `busy`, `missing` |
-| `upload {id}` (after the page painted) | reads the G-code, presets, builds the payload with `installId`, POSTs; in browser mode opens the device page | `logged {url, mode, browser?}` or `failed {message, declined}` |
+| `upload {id}` (after the page painted) | reads the G-code, presets, builds the payload with `installId`, POSTs; in window mode opens the claim page window, in browser mode the device page | `logged {url, mode, window? {ok, message}, browser?}` or `failed {message, declined}` |
+| `open_claim {id}` | opens a logged slice's claim page window again (closing one already open) | `window {ok, message}` |
 | `open_browser` | `webbrowser.open(device URL)` | `browser {ok, message, url}` |
 
 The page renders each slice (name, time sliced, destination, status badge, message) with **Log to 3D Print Log**,
-and **Open claim page** once logged. On `uploading` it waits one animation frame and 30 ms so "Uploading…" paints,
-then sends `upload`. On `logged` in tab mode it sets `window.location.href` to the claim URL (top-level navigation).
+and, in window mode, **Open claim page** once logged. On `uploading` it waits one animation frame and 30 ms so
+"Uploading…" paints, then sends `upload`. On `logged` it says "Logged. The claim page opened in an OrcaSlicer
+window." (or why the window could not open), or in browser mode "Logged. Claim it in your browser.". The footer
+says what Log does in the current mode.
 On `already_logged` it shows "This slice is already logged. Log it again?" with **Log again** (`relog: true`).
 A declined prompt shows "Orca blocked the upload because permission was declined. Click Log again to be asked
 again."; other failures show the API's message (`HTTP 429, too many uploads ...`) or "slice again" when the temp file
 is gone.
 
-**Coming back from the claim page.** Python cannot navigate the tab or call `get_ui` again, and the remote page
-cannot reach the plugin's HTML by URL. What works per the source: history Back. The webview's context menu is enabled
-(`WebView.cpp:408`), so right-click > Back (or Alt+Left on WebView2) returns. On WebKit (macOS, Linux) that
-navigation commits the `file:///<resources>/web/` base URL, which `WebPanel::on_load_event` answers by calling
-`get_ui()` again (`WebPanel.cpp:58-61`); on Edge the `SetPage` content is restored by the webview itself
-(`WebPanel.cpp:48-52`). Either way the page's script runs again and sends `ready`. The tab's footer says how. A
-"Back to OrcaSlicer" button in the web app (shown when `window.orca` exists, calling `history.back()`) would make
-this obvious; that is a 3d-print-log-ui follow-up.
+**The claim page window** (`open_claim_page: "window"`, the default). The first design navigated the tab to the
+claim page and relied on history Back to return. The 2.5.0-alpha e2e run showed that does not work: Back (Orca's
+context menu, or the web app's `history.back()`) lands on a blank page and the list is gone until a restart. So the
+tab never navigates; its script sets no location, cancels clicks on links (a `target=_blank` link would load in
+the tab, `PluginPages.cpp:132-138`) and replaces `window.open`. After a log the plugin calls
+`orca.host.ui.create_window` (title "3D Print Log", 1040 x 820, modeless) with a small HTML page that posts
+`{type: "shown", token}` (a per-window token) and sets `location.href` to the claim URL. There is one window at a
+time: a new one closes the old. The web app's **Back to OrcaSlicer** calls `window.orca.close()` (a 3d-print-log-ui
+change); closing the window any way fires `on_close`, which refreshes the tab (no I/O: it runs outside an audit
+context). History Back in the window returns to the plugin's HTML (WebKit reloads the base URL and `WebDialog`
+reloads the HTML; Edge restores it), which would go straight back to the claim page; the second `shown` makes the
+plugin close the window instead. Opening the window is not I/O, so it asks for nothing. The script opens the window
+too.
 
 #### Flow
 
 1. The user enables the plugin once in the Plugins window. No preset step.
 2. **Slice** (`GCodeExportFinished`, slicing thread): list it. No I/O, no UI call.
 3. **Notification** (`SlicingJobComplete`, UI thread): if `slice_notification` is on, push "Sliced <model>. Open
-   the 3D Print Log tab to log it." once per slice ("the plate" without a model name). Plain text: a link's
-   `on_click` runs unaudited, and Python cannot bring the tab forward. The built tab is refreshed too.
+   the 3D Print Log tab to log it." once per slice. `GCodeExportFinished` carries an empty `ctx.name` for an STL
+   project (2.5.0-alpha e2e run), so when the slice has no name the plugin asks Orca's model in memory, here on the
+   UI thread: `orca.host.plater().project_path()` (the saved project's file name without `.3mf`), else
+   `orca.host.model().objects()` names without the model extension ("Cube", "Cube and Benchy", "Cube and 2 more"),
+   else "your plate". That name is for the tab ("Your plate") and the notifications only; the upload is still named
+   from the G-code. Plain text: a link's `on_click` runs unaudited, and Python cannot bring the tab forward. The
+   built tab is refreshed too.
 4. **Sends** (`UploadStarted`, `PrintJobStarted`, `SendJobStarted`, worker threads): mark the latest slice. A Bambu
    send leaves a notice that the next `PrintStateChanged` (UI thread) shows once: "Sent <model> to the printer. Open
    the 3D Print Log tab to log it." A print-host upload has no UI-thread event after it; the tab shows it.
@@ -249,7 +283,7 @@ this obvious; that is a 3d-print-log-ui follow-up.
    preset ids on the latest slice. The Bambu after-slice run does nothing. It never fails the slice.
 6. **Log** (tab, UI thread): the two-message flow above. Orca's prompts appear during step two.
 7. **Script** "Log last slice to 3D Print Log" (UI thread): the same upload for the latest slice, again if it was
-   logged; the result message says where to claim it. It refreshes the tab.
+   logged; it then opens the claim page window (or the browser, in browser mode). It refreshes the tab.
 8. **Upload** (`uploader.run`): read the hook's copy or the temp G-code (windowed text and a full scan for object
    bounds), take the preset names and slicer version from the G-code when no hook supplied them, name the print
    after the first object when there is no model or project name, collect user presets, scrub, build the payload
@@ -260,7 +294,7 @@ this obvious; that is a 3d-print-log-ui follow-up.
 ```json
 {
   "template": "default",
-  "open_claim_page": "tab",
+  "open_claim_page": "window",
   "api_base": "https://api.3dprintlog.com",
   "web_base": "https://www.3dprintlog.com",
   "slice_notification": true,
@@ -268,8 +302,9 @@ this obvious; that is a 3d-print-log-ui follow-up.
 }
 ```
 
-`template` is `default` or `full` (the uploader's `--default` / `--full`). `open_claim_page` is `tab` (the tab
-navigates to the claim page) or `browser` (open the device page in the system browser after each log).
+`template` is `default` or `full` (the uploader's `--default` / `--full`). `open_claim_page` is `window` (open the
+claim page in an OrcaSlicer window after each log) or `browser` (open the device page in the system browser after
+each log); `tab`, 0.1.0's name for `window`, is read as `window`.
 `slice_notification` turns the notifications off. `debug` writes the payload metadata and the API response to
 `<storage>/debug/last-upload.json`, like `--debug`. Keys from earlier builds (`open_browser`,
 `bambu_send_window_minutes`) are ignored.
@@ -392,10 +427,18 @@ ships as `PrintLog.SlicerSettings` 0.2.0 via a `lib-v0.2.0` tag.
   (`slicing`, `upload`, `job`, `ui`); the fake audit hook plays the prompts (modal on the UI thread, answered Yes by
   default or No through `_audit.answer`, denied off it, exact-target grants, the per-call cascade); with strict
   tracking on, any plugin I/O outside an audit context is recorded and an autouse guard fails the test;
-  `push_notification` is allowed only on the UI thread; `orca.pages` and `orca_driver.Page` play the tab
-  (`get_ui`, `on_message` on the UI thread, `post_message` into the page's inbox); `webbrowser.open` is replaced by
+  `push_notification` and `create_window` are allowed only on the UI thread; `orca.pages` and `orca_driver.Page`
+  play the tab (`get_ui`, `on_message` on the UI thread, `post_message` into the page's inbox); `create_window`
+  records each window (HTML, size, style, `on_message`, `on_close`), `close()` runs after the callback as
+  `CallAfter` would, and `orca_driver.window_message` / `close_window` call the window's handlers outside any audit
+  context; `orca.host.plater()` / `model()` serve a project path and object names; `webbrowser.open` is replaced by
   a stand-in that raises the Windows process audit event. Covered: a slice is listed with no I/O and notifies once
-  from the UI thread; Log paints "uploading" first, uploads once and navigates to the claim URL; Log twice asks
+  from the UI thread; an unnamed slice is named for the project, its objects or "your plate", with no I/O, and
+  the upload keeps the G-code's name; Log paints "uploading" first, uploads once and opens a window with the claim
+  URL while the tab's HTML never changes and has no way to navigate; closing the window (user or
+  `window.orca.close()`) refreshes the tab; Back to the window's own HTML closes it; tokenless window messages are
+  ignored; Open claim page reopens a window and replaces the open one; a window that cannot open is explained;
+  `tab` is read as `window`; the footer matches the mode; Log twice asks
   before logging again; a declined prompt is explained and the next click asks again; API errors and a gone slice;
   Open in browser opens one constant URL with the install id and asks once; browser mode; the install id persists
   and goes with every upload; tokenless messages (a remote page) are ignored; `UploadStarted` / Bambu events mark
@@ -420,14 +463,18 @@ ships as `PrintLog.SlicerSettings` 0.2.0 via a `lib-v0.2.0` tag.
 4. **UI freeze**: how long Orca freezes during Log for a small and a large (100 MB+) G-code (the object-bounds scan
    reads the whole file). If it is long, consider scanning in the hook, or a smaller timeout.
 5. "Uploading…" paints before the freeze (the page waits a frame and 30 ms).
-6. **Claim page in the tab**: the tab navigates to `/prints/new/cura?...`; Auth0 sign-in inside Orca works; does
-   Google sign-in (disallowed-useragent)? Does the session persist across Orca restarts?
-7. **Back to the list**: right-click > Back and Alt+Left on Windows; right-click > Back on macOS. The list comes back
-   (Edge restores the `SetPage` content, WebKit re-runs `get_ui`) and shows the slice as logged.
+6. **Claim page window**: after Log a "3D Print Log" window opens on `/prints/new/cura?...` while the tab keeps
+   its list; the user is signed in there if they were in the tab (shared cookie store, per the source); Auth0
+   sign-in inside Orca works; does Google sign-in (disallowed-useragent)? Does the session persist across Orca
+   restarts? The window is modeless, sized 1040 x 820, and can be maximized.
+7. **Back to the list**: the web app's **Back to OrcaSlicer** (`window.orca.close()`) and the window's close box
+   close it, and the tab shows the slice as logged; right-click > Back in the window closes it too; Open claim page
+   opens it again. The tab never goes blank.
 8. Open in browser: one "run the following command: .../prints/new/orca?device=..." prompt, then none in later
    sessions; the page lists the install's uploads. `open_claim_page: "browser"` opens it after a Log.
 9. `GCodeExportFinished` arrives for a Bambu and a non-Bambu printer with `code = Ok` and `msg` = the temp path; what
-   `ctx.name` holds for an STL project and for a 3MF with a model name.
+   `ctx.name` holds for an STL project (2.5.0-alpha: empty; the slice is then named from the project or its
+   objects) and for a 3MF with a model name.
 10. Notifications: "Sliced ..." once per slice from `SlicingJobComplete`; "Sent ... to the printer" after a Bambu
     send on the next `PrintStateChanged`; whether 10 s is long enough.
 11. Bambu single-printer send: `PrintJobStarted` arrives (job worker) and marks "Sent to Bambu"; the upload is named
@@ -447,5 +494,6 @@ ships as `PrintLog.SlicerSettings` 0.2.0 via a `lib-v0.2.0` tag.
   events covered by their parent grant; an audit context for notification `on_click` and window `on_message`; a
   scoped root for the plate G-code in `GCodeExportFinished` / `UploadStarted`; prefix `fs_read` roots; an event on
   Export G-code to file and the host file name in `UploadStarted`; a way to select or navigate a Pages tab from
-  Python.
+  Python, or a way for a Pages tab to reload its own HTML after it navigated away; a URL argument for
+  `create_window`; a model name in `GCodeExportFinished` for an STL project.
 - Matching an upload to the plate it sends when several plates were sliced.

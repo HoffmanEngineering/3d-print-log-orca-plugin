@@ -1,8 +1,25 @@
 """The HTML of the 3D Print Log tab. Inline (no file read in get_ui), themed with the CSS
 variables Orca sets on every hosted page (WebViewHostDialog::theme_user_script: --orca-bg,
---orca-fg, --orca-muted, --orca-border, --orca-accent, --orca-accent-fg, --orca-font)."""
+--orca-fg, --orca-muted, --orca-border, --orca-accent, --orca-accent-fg, --orca-font).
 
+The page never navigates (see page.py): no script here sets a location, links do nothing, and
+window.open returns null. The claim page opens in an OrcaSlicer window the plugin opens."""
+
+import html
 import json
+
+# The footer for each open_claim_page mode. The script swaps it when the mode changes.
+FOOTERS = {
+    "window": (
+        "Log opens the claim page in an OrcaSlicer window; close it (or click Back to "
+        "OrcaSlicer) to come back to this list. Open in browser shows the prints this "
+        "OrcaSlicer uploaded, in your own browser."
+    ),
+    "browser": (
+        "Log opens your browser at the prints this OrcaSlicer uploaded, where you claim it. "
+        "Open in browser opens the same page."
+    ),
+}
 
 _HTML = """<!doctype html>
 <html lang="en">
@@ -51,14 +68,24 @@ _HTML = """<!doctype html>
 <div id="list"></div>
 <p id="empty" class="muted" hidden>No slices yet in this session. Slice a plate, then log it
 here.</p>
-<footer class="muted">The claim page opens in this tab. To come back to this list, right-click
-the page and choose Back (or press Alt+Left). Open in browser shows the prints this OrcaSlicer
-uploaded, in your own browser.</footer>
+<footer id="footer" class="muted">__FOOTER__</footer>
 <script>
 (function () {
   var TOKEN = __TOKEN__;
-  var state = { mode: 'tab', slices: [] };
+  var FOOTERS = __FOOTERS__;
+  var state = { mode: __MODE__, slices: [] };
   var confirming = {};
+
+  // The tab must never leave this page: Orca cannot bring it back.
+  document.addEventListener('click', function (e) {
+    var node = e.target;
+    while (node && node !== document) {
+      if (node.tagName === 'A') { e.preventDefault(); return; }
+      node = node.parentNode;
+    }
+  }, true);
+  document.addEventListener('submit', function (e) { e.preventDefault(); }, true);
+  window.open = function () { return null; };
 
   function send(type, extra) {
     var message = { type: type, token: TOKEN };
@@ -126,9 +153,10 @@ uploaded, in your own browser.</footer>
         notice('');
         send('log', { id: s.id });
       }, false, uploading || busy() || !s.canLog));
-      if (s.claimUrl) {
+      if (s.claimUrl && state.mode === 'window') {
         actions.appendChild(button('Open claim page', function () {
-          window.location.href = s.claimUrl;
+          notice('');
+          send('open_claim', { id: s.id });
         }, true, uploading));
       }
     }
@@ -143,6 +171,7 @@ uploaded, in your own browser.</footer>
     state.slices.forEach(function (s) { list.appendChild(row(s)); });
     document.getElementById('empty').hidden = state.slices.length > 0;
     document.getElementById('browser').disabled = busy();
+    if (FOOTERS[state.mode]) document.getElementById('footer').textContent = FOOTERS[state.mode];
   }
 
   function onEvent(event) {
@@ -159,9 +188,12 @@ uploaded, in your own browser.</footer>
         notice(event.browser && event.browser.ok
           ? 'Logged. Claim it in your browser.' : (event.browser ? event.browser.message : ''),
           !(event.browser && event.browser.ok));
-      } else if (event.url) {
-        window.location.href = event.url;
+      } else if (event.window) {
+        notice(event.window.ok ? 'Logged. The claim page opened in an OrcaSlicer window.'
+          : event.window.message, !event.window.ok);
       }
+    } else if (event.kind === 'window') {
+      if (!event.ok) notice(event.message, true);
     } else if (event.kind === 'failed' && event.id === null) {
       notice(event.message, true);
     } else if (event.kind === 'missing' && event.message) {
@@ -196,5 +228,11 @@ uploaded, in your own browser.</footer>
 """
 
 
-def render(token):
-    return _HTML.replace("__TOKEN__", json.dumps(token))
+def render(token, mode="window"):
+    footer = FOOTERS.get(mode, FOOTERS["window"])
+    return (
+        _HTML.replace("__TOKEN__", json.dumps(token))
+        .replace("__FOOTERS__", json.dumps(FOOTERS))
+        .replace("__MODE__", json.dumps(mode))
+        .replace("__FOOTER__", html.escape(footer))
+    )

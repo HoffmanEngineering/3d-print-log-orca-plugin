@@ -5,7 +5,8 @@ every printer and profile. Events only record what happened to a slice; nothing 
 user clicks Log in the 3D Print Log tab (page.py) or runs the script (script.py), so Orca's
 permission prompts come at that click. The uploader watches:
 - GCodeExportFinished (slicing thread): records the slice. No I/O.
-- SlicingJobComplete (UI thread): the "Sliced <model>" notification.
+- SlicingJobComplete (UI thread): names a slice whose event had no name (plate.py), and the
+  "Sliced <name>" notification.
 - UploadStarted (print-host queue thread), PrintJobStarted / SendJobStarted (job worker): marks
   the latest slice sent. No I/O.
 - PrintStateChanged (UI thread): shows the notice a Bambu send left.
@@ -22,7 +23,7 @@ import sys
 
 import orca
 
-from printlog_orca import controller, page
+from printlog_orca import controller, page, plate
 from printlog_orca.page import PrintLogPage
 from printlog_orca.script import LogLastSlice
 
@@ -102,7 +103,9 @@ class PrintLogUploader(orca.slicing.SlicingPipelineCapabilityBase):
                 shared.record_slice(ctx.msg, ctx.name)
         elif name == controller.SLICE_DONE_EVENT:
             if ctx.code == orca.LifecycleEvtCode.Ok:
-                self._notify(shared.slicing_done())
+                # GCodeExportFinished's ctx.name is empty for an STL project: ask the project.
+                display_name = plate.display_name() if shared.needs_display_name() else ""
+                self._notify(shared.slicing_done(display_name))
         elif name == controller.STATE_EVENT:
             self._notify(shared.take_send_notice())
         else:

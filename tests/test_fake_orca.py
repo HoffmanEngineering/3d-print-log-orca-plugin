@@ -169,3 +169,56 @@ def test_a_page_gets_its_messages_on_the_ui_thread_and_replies_after_the_call():
 def request(url):
     """The event OpenerDirector.open raises before it connects."""
     sys.audit("urllib.Request", url, None, {}, "POST")
+
+
+def test_create_window_is_ui_thread_only_and_returns_a_live_handle():
+    ui.reset()
+    with _callback.inside("slicing"), pytest.raises(AssertionError):
+        ui.create_window("<p>x</p>")
+    with _callback.inside("ui"):
+        window = ui.create_window("<p>x</p>", title="T", width=0)
+
+    assert window.is_open() and (window.width, window.height) == (820, 600)
+    assert window.style == ui.WINDOW_MODELESS
+
+
+def test_create_window_rejects_unknown_style_flags():
+    with _callback.inside("ui"), pytest.raises(ValueError):
+        ui.create_window("<p>x</p>", style=2)
+
+
+def test_a_window_closes_after_the_callback_and_fires_on_close_once_outside_any_callback():
+    ui.reset()
+    seen = []
+    with _callback.inside("ui"):
+        window = ui.create_window("<p>x</p>", on_close=lambda: seen.append(_callback.current()))
+        window.close()
+        assert window.is_open()  # CallAfter: not yet
+    ui.run_pending()
+    orca_driver.close_window(window)
+
+    assert seen == [None]
+    assert window.is_open() is False
+
+
+def test_window_messages_run_outside_any_callback():
+    ui.reset()
+    seen = []
+    with _callback.inside("ui"):
+        window = ui.create_window(
+            "<p>x</p>", on_message=lambda d: seen.append((d, _callback.current()))
+        )
+
+    orca_driver.window_message(window, {"a": 1})
+
+    assert seen == [({"a": 1}, None)]
+
+
+def test_the_host_reads_the_project_only_on_the_ui_thread():
+    orca.host.app.reset()
+    orca.host.app.project_path = "/p/Desk.3mf"
+    with pytest.raises(RuntimeError):
+        orca.host.plater().project_path()
+    with _callback.inside("ui"):
+        assert orca.host.plater().project_path() == "/p/Desk.3mf"
+    orca.host.app.reset()

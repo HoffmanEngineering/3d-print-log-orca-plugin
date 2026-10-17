@@ -10,8 +10,9 @@ import orca
 import orca_driver
 import pytest
 from orca import _audit
+from orca.host import ui
 
-from printlog_orca import controller, page, uploader
+from printlog_orca import claim_window, controller, page, page_html, uploader
 from printlog_orca.client import UploadResult
 
 TAB = "3D Print Log"
@@ -36,16 +37,17 @@ class Tab:
     def __init__(self, capability):
         self.page = orca_driver.Page(capability)
         self.token = re.search(r'var TOKEN = "([0-9a-f]{32})"', self.page.html).group(1)
-        self.location = None  # where the tab navigated itself
         self.seen = []  # every state the page rendered
         self.ready()
 
     def send(self, kind, **extra):
         replies = self.page.send({"type": kind, "token": self.token, **extra})
         self.seen.extend(replies)
-        (reply,) = replies
-        assert reply["type"] == "state"
-        return reply
+        assert replies and all(r["type"] == "state" for r in replies)
+        # The reply carries the event; a claim page window closed on the way adds a plain state.
+        replied = [r for r in replies if "event" in r]
+        assert len(replied) <= 1
+        return replied[0] if replied else replies[-1]
 
     def ready(self):
         return self.send("ready")
@@ -59,11 +61,16 @@ class Tab:
         if reply["event"]["kind"] != "uploading":
             return reply
         self.painted = [s for s in reply["slices"] if s["id"] == slice_id][0]
-        reply = self.send("upload", id=slice_id)
-        event = reply["event"]
-        if event["kind"] == "logged" and event["mode"] == "tab":
-            self.location = event["url"]
-        return reply
+        return self.send("upload", id=slice_id)
+
+
+def window_url(window):
+    """Where the window's page sends itself: the URL in its redirect script."""
+    return json.loads(re.search(r"var TARGET = (\"[^\"]*\");", window.html).group(1))
+
+
+def window_token(window):
+    return re.search(r'var TOKEN = "([0-9a-f]{32})"', window.html).group(1)
 
 
 @pytest.fixture
@@ -153,17 +160,24 @@ def test_sends_show_their_destination(env):
     ]
 
 
-def test_log_paints_uploading_first_then_uploads_once_and_opens_the_claim_page(env):
+def test_log_paints_uploading_first_then_uploads_once_and_opens_the_claim_page_window(env):
     capabilities, tab, api, temp, storage = env
     sliced(capabilities, temp)
     (item,) = tab.slices()
+    html = tab.page.html
 
     reply = tab.click_log(item["id"])
 
     assert tab.painted["status"] == "uploading"
     assert reply["event"]["kind"] == "logged"
+    assert reply["event"]["mode"] == "window"
+    assert reply["event"]["window"] == {"ok": True, "message": ""}
     assert len(api) == 1
-    split = urlsplit(tab.location)
+    (window,) = ui.windows
+    assert (window.thread_kind, window.style, window.open) == ("ui", ui.WINDOW_MODELESS, True)
+    assert window.title == "3D Print Log"
+    assert window_url(window) == reply["event"]["url"]
+    split = urlsplit(window_url(window))
     assert (split.scheme, split.netloc, split.path) == (
         "https",
         "www.3dprintlog.com",
@@ -176,8 +190,10 @@ def test_log_paints_uploading_first_then_uploads_once_and_opens_the_claim_page(e
     }
     (item,) = reply["slices"]
     assert item["status"] == "logged"
-    assert item["claimUrl"] == tab.location
+    assert item["claimUrl"] == window_url(window)
     assert f'"installId": "{install_id(storage)}"' in api[0]
+    # The tab itself never moves: it was not reloaded, and its page has no way to navigate.
+    assert tab.page.html == html
 
 
 def test_the_click_is_where_orca_asks_for_the_file(env):
@@ -227,7 +243,7 @@ def test_a_declined_prompt_is_explained_and_the_next_click_asks_again(env):
     }
     (item,) = reply["slices"]
     assert (item["status"], item["error"]) == ("not logged", True)
-    assert tab.location is None
+    assert ui.windows == []
     assert api == []
 
     _audit.answer = None
@@ -245,7 +261,7 @@ def test_an_api_error_shows_the_apis_message(env):
     assert reply["event"]["kind"] == "failed"
     assert "HTTP 429, too many uploads" in reply["event"]["message"]
     assert reply["slices"][0]["message"] == reply["event"]["message"]
-    assert tab.location is None
+    assert ui.windows == []
 
 
 def test_a_slice_whose_file_is_gone_says_so(env):
@@ -292,7 +308,8 @@ def test_browser_mode_opens_the_device_page_after_a_log_instead_of_navigating(en
 
     assert reply["mode"] == "browser"
     assert reply["event"]["browser"]["ok"] is True
-    assert tab.location is None
+    assert "window" not in reply["event"]
+    assert ui.windows == []
     assert browser.opened == [
         f"https://www.3dprintlog.com/prints/new/orca?device={install_id(storage)}"
     ]
@@ -318,7 +335,7 @@ def test_messages_without_the_pages_token_are_ignored(env):
     sliced(capabilities, temp)
     slice_id = tab.slices()[0]["id"]
 
-    # The claim page (or any page it links to) runs in the tab and gets window.orca too.
+    # Any other page shown in Orca's webviews gets a window.orca too, but not this token.
     for message in ({"type": "log", "id": slice_id}, {"type": "open_browser", "token": "x"}, "hi"):
         assert tab.page.send(message) == []
     assert api == []
@@ -364,3 +381,162 @@ def test_the_tab_logs_the_hooks_exact_exported_file(env, tmp_path):
     assert reply["event"]["kind"] == "logged"
     assert '"outputName": "Benchy_PLA.gcode"' in api[0]
     assert _audit.prompts == []  # the copy is in plugin storage: nothing to ask
+
+
+# --- the claim page window ---------------------------------------------------------------
+
+
+def test_the_tab_page_cannot_navigate_itself(env):
+    _, tab, *_ = env
+
+    html = tab.page.html
+    # No script in the tab sets a location, and links and window.open are disarmed: Orca's tab
+    # loads a target=_blank link in the tab itself (PluginPage::on_new_window).
+    assert "location" not in html
+    assert "<a " not in html
+    assert "preventDefault" in html
+    assert "window.open = function" in html
+
+
+def test_closing_the_window_refreshes_the_tab(env):
+    capabilities, tab, _, temp, _ = env
+    sliced(capabilities, temp)
+    tab.click_log(tab.slices()[0]["id"])
+    (window,) = ui.windows
+    tab.page.inbox.clear()
+
+    orca_driver.close_window(window)
+
+    assert window.open is False
+    (message,) = tab.page.inbox
+    assert message["type"] == "state"
+    assert message["slices"][0]["status"] == "logged"
+
+
+def test_the_web_apps_back_to_orcaslicer_closes_the_window(env):
+    capabilities, tab, _, temp, _ = env
+    sliced(capabilities, temp)
+    tab.click_log(tab.slices()[0]["id"])
+    (window,) = ui.windows
+    tab.page.inbox.clear()
+
+    orca_driver.close_window(window, by="page")  # window.orca.close() from the claim page
+
+    assert window.open is False
+    assert tab.page.inbox[-1]["type"] == "state"
+
+
+def test_history_back_to_the_redirect_page_closes_the_window(env):
+    capabilities, tab, _, temp, _ = env
+    sliced(capabilities, temp)
+    tab.click_log(tab.slices()[0]["id"])
+    (window,) = ui.windows
+    shown = {"type": "shown", "token": window_token(window)}
+
+    orca_driver.window_message(window, shown)  # the first load, on its way to the claim page
+    assert window.open is True
+
+    tab.page.inbox.clear()
+    orca_driver.window_message(window, shown)  # Back (or history.back()) from the claim page
+
+    assert (window.open, window.closed_by) == (False, "plugin")
+    assert tab.page.inbox[-1]["type"] == "state"
+
+
+def test_the_window_ignores_messages_without_its_token(env):
+    capabilities, tab, _, temp, _ = env
+    sliced(capabilities, temp)
+    tab.click_log(tab.slices()[0]["id"])
+    (window,) = ui.windows
+
+    for message in ({"type": "shown"}, {"type": "shown", "token": tab.token}, "hi", None):
+        orca_driver.window_message(window, message)
+        orca_driver.window_message(window, message)
+
+    assert window.open is True
+
+
+def test_open_claim_page_opens_a_window_for_that_slice_and_replaces_an_open_one(env):
+    capabilities, tab, _, temp, _ = env
+    sliced(capabilities, temp)
+    slice_id = tab.slices()[0]["id"]
+    tab.click_log(slice_id)
+    (first,) = ui.windows
+    prompts = list(_audit.prompts)
+
+    reply = tab.send("open_claim", id=slice_id)
+
+    assert reply["event"] == {"kind": "window", "id": slice_id, "ok": True, "message": ""}
+    old, new = ui.windows
+    assert old is first and old.open is False
+    assert new.open is True
+    assert window_url(new) == reply["slices"][0]["claimUrl"]
+    assert _audit.prompts == prompts  # a window is not I/O: nothing to ask
+
+
+def test_open_claim_page_for_a_slice_not_logged_opens_nothing(env):
+    capabilities, tab, _, temp, _ = env
+    sliced(capabilities, temp)
+
+    reply = tab.send("open_claim", id=tab.slices()[0]["id"])
+
+    assert reply["event"]["kind"] == "window"
+    assert reply["event"]["ok"] is False
+    assert ui.windows == []
+
+
+def test_the_window_url_is_escaped_into_its_script():
+    html = claim_window.render('https://x.test/a?b=1&c="</script><b>', "0" * 32)
+
+    assert "</script><b>" not in html
+    assert html.count("</script>") == 1
+
+
+def test_a_window_that_cannot_open_is_explained_and_the_slice_stays_logged(env, monkeypatch):
+    capabilities, tab, api, temp, _ = env
+    sliced(capabilities, temp)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("OrcaSlicer application is not initialized")
+
+    monkeypatch.setattr(ui, "create_window", broken)
+    reply = tab.click_log(tab.slices()[0]["id"])
+
+    assert reply["event"]["kind"] == "logged"
+    assert reply["event"]["window"]["ok"] is False
+    assert "Open in browser" in reply["event"]["window"]["message"]
+    assert reply["slices"][0]["status"] == "logged"
+    assert len(api) == 1
+
+
+def test_tab_is_an_alias_for_window(env):
+    capabilities, tab, _, temp, _ = env
+    capabilities["3D Print Log uploader"].save_config(json.dumps({"open_claim_page": "tab"}))
+    sliced(capabilities, temp)
+
+    reply = tab.click_log(tab.slices()[0]["id"])
+
+    assert reply["mode"] == "window"
+    assert len(ui.windows) == 1
+
+
+def footer(html):
+    return re.search(r'<footer id="footer" class="muted">([^<]*)</footer>', html).group(1)
+
+
+def test_the_footer_matches_the_mode(env):
+    capabilities, tab, *_ = env
+
+    assert footer(tab.page.html) == page_html.FOOTERS["window"]
+    assert "OrcaSlicer window" in page_html.FOOTERS["window"]
+    assert "in this tab" not in page_html.FOOTERS["window"]
+    assert "your browser" in page_html.FOOTERS["browser"]
+    assert "window" not in page_html.FOOTERS["browser"]
+
+    capabilities["3D Print Log uploader"].save_config(json.dumps({"open_claim_page": "browser"}))
+    html = tab.page.reload()
+
+    assert footer(html) == page_html.FOOTERS["browser"]
+    assert 'var state = { mode: "browser"' in html
+    # The script swaps the footer when the mode changes while the tab is open.
+    assert f"var FOOTERS = {json.dumps(page_html.FOOTERS)};" in html
