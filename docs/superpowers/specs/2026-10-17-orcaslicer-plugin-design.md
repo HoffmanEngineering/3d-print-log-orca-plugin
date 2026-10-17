@@ -38,7 +38,14 @@ labeled experimental and may change.
 - No slice-statistics or thumbnail API: everything comes from the G-code comments, as with the uploader.
 - Network, file and process calls go through an audit hook that asks the user once per target and remembers the
   answer (reset on plugin update). No prompt for `data_dir()` and the plugin's own storage. Paths containing
-  `secret`, `cert` or `conf` are refused.
+  `secret`, `cert` or `conf` are refused. The audit context is `thread_local` and set only inside Orca's calls into
+  the plugin, so a thread the plugin starts itself is not audited at all (`plugin_audit_hook.md`).
+- `orca.host.plugin.storage()` (`<data_dir>/orca_plugins/plugin_data/<plugin_key>`) works only inside a plugin
+  callback. There is no `data_dir()` binding; the plugin derives it from the storage path.
+- A local plugin's key, install folder, config and storage follow the entry file's name
+  (`PluginLoader.cpp`). A wheel's importable package comes from `Import-Name` in its `METADATA`, then
+  `top_level.txt`, then the normalized `Name`; every `Requires-Dist` line is a dependency Orca installs.
+- Lifecycle events reach every enabled capability of every type, whether or not a preset uses it.
 - Plugin config is plaintext JSON (`get_default_config()` / `get_config()`), edited in the Plugins window.
 - `orca.host.ui.*` must not be called from the slicing thread.
 
@@ -53,7 +60,10 @@ labeled experimental and may change.
    nothing secret sits in the plaintext plugin config.
 3. **Upload on export or send, never on slice alone.** Bambu's after-slice run stages the file; the send uploads it.
 4. **Packaged as a pure-Python wheel** (`py3-none-any`, no dependencies), so the code can be split into small,
-   testable modules and still installs as one file.
+   testable modules and still installs as one file. Built with hatchling and `import-names = ["printlog_orca"]`
+   (the distribution name does not normalize to the package), dev tools in a dependency group rather than an extra
+   (an extra would be a `Requires-Dist` Orca installs), and released under the fixed name `3d-print-log.whl` so a
+   new release replaces the old one.
 
 ## Components
 
@@ -65,11 +75,12 @@ Package `printlog_orca`:
 |---|---|
 | `plugin.py` | `@orca.plugin` class and the `PrintLogUploader` capability (`SlicingPipelineCapabilityBase`): `execute`, `on_lifecycle_event`, default config. With `script.py`, the only modules that import `orca`. |
 | `script.py` | `LogLastSlice` script capability: uploads the staged slice on demand (the Bambu fallback). |
+| `controller.py` | State the two capabilities share, without `orca`: config parsing and defaults, the staging folder, starting jobs. `plugin.py` and `script.py` pass it plain values. |
 | `triggers.py` | Pure decision logic: given a hook call or lifecycle event and the staged state, say upload now / stage / upload staged / ignore. |
 | `staging.py` | Copies the working G-code into plugin storage and remembers the staged slice (path, output name, config values, time). One staged slice; a new slice replaces it. |
 | `gcode_window.py` | Reads the head and tail of a G-code file the same way `GcodeWindow.ReadFromFile` does (2,000,000 bytes each; whole file when it fits). |
 | `object_bounds.py` | Port of `ObjectBoundsScanner`: per-object extrusion bounding boxes from the full toolpath, for `{{models}}`. |
-| `presets.py` | Finds the user preset JSONs named by `print_settings_id`, `filament_settings_id` and `printer_settings_id` (with their `inherits` chains) under `data_dir()/user/`, and strips credential keys. |
+| `presets.py` | Finds the user preset JSONs named by `print_settings_id`, `filament_settings_id` and `printer_settings_id` (with their `inherits` chains) under `data_dir()/user/`, and strips credential keys. Numbers are kept as written and the first of duplicate keys wins, as the uploader reads them; an ambiguous (two accounts) or unreadable preset is left out. |
 | `scrub.py` | Blanks sensitive `; key = value` lines and preset keys, using the API's `SlicerSettingsScrubber` rules. |
 | `payload.py` | Builds the multipart request body. |
 | `client.py` | POSTs with `urllib`, maps responses to results, builds the new-print URL. |
@@ -93,10 +104,12 @@ Package `printlog_orca`:
    expires; nothing uploads.
 4. The worker reads the windowed text, scans the full file for object bounds, collects user presets, scrubs, builds
    the payload and POSTs it. On success it opens the new-print URL with `webbrowser.open` when `open_browser` is true.
-   The working copy and staged files are deleted after the upload.
+   The working copy and staged files are deleted after the upload. The worker never calls `orca.host`: the storage
+   folder and `data_dir` are read in the hook and handed to it.
 
-Config keys read through `ctx.config_value`: `print_settings_id`, `filament_settings_id`, `printer_settings_id`.
-Everything else comes from the G-code itself.
+Config keys read through `ctx.config_value`: `print_settings_id`, `filament_settings_id`, `printer_settings_id`
+(serialized as Orca writes them: `filament_settings_id` is a `;`-joined, quoted string list). Everything else comes
+from the G-code itself.
 
 #### Plugin config (`get_default_config()`)
 
@@ -122,7 +135,8 @@ Request: `multipart/form-data` with
 
 - `gcode`: file part, gzip of the UTF-8 windowed G-code text (head, `\n`, tail; or the whole file when it is at most
   4,000,000 bytes).
-- `metadata`: JSON string:
+- `metadata`: JSON string (`outputName` is the file name only, split at either separator: an export path holds
+  the user's account name, and the server's `Path.GetFileName` on Linux would not split at a backslash):
 
 ```json
 {
@@ -208,8 +222,10 @@ ships as `PrintLog.SlicerSettings` 0.2.0 via a `lib-v0.2.0` tag.
 - Worker: network error, timeout (30 s), 4xx or 5xx are logged to Orca's Python log with the status and the API's
   message; a `push_notification` is attempted only if the spike shows it is safe off the main thread. No retries, no
   offline queue (parity with the uploader).
-- Permission prompts: the first upload asks for network access to `api.3dprintlog.com`; opening the browser may ask
-  once. A "No" is logged and the upload is dropped.
+- Permission prompts: none are expected. The hook only reads the G-code (in a folder Orca allows for that call) and
+  writes plugin storage (inside `data_dir()`); the upload and the browser opening run on the worker thread, which
+  Orca does not audit. If a later Orca audits plugin threads, the first upload would ask for `api.3dprintlog.com`
+  and a "No" is logged and drops the upload.
 - API: never throws on any text; a parse that fails stores an empty note with slicer `Unknown`, as the connector
   endpoint does.
 
@@ -226,13 +242,19 @@ ships as `PrintLog.SlicerSettings` 0.2.0 via a `lib-v0.2.0` tag.
 
 ## Spike against 2.5.0-alpha (manual, once Chris has the build)
 
-1. Wheel installs through "Install local plugin"; the capability appears in Process > Others.
+1. The wheel (`3d-print-log.whl`, the name releases use) installs from the Plugins window; both capabilities
+   appear, and the uploader can be picked in Process > Others > Slicing Pipeline Plugin. Installing it again
+   replaces it in place and keeps the config.
 2. Export to file and a print-host upload each upload once; Bambu slice alone uploads nothing.
 3. Bambu single-printer send: `PrintStateChanged` arrives with `PREPARE`/`RUNNING` and the staged slice uploads.
 4. `webbrowser.open` from the worker thread works (and what it prompts).
 5. `push_notification` from the worker thread: safe or not.
-6. The network prompt appears once for `api.3dprintlog.com` and is remembered.
+6. No permission prompt appears for the upload or the browser (the worker thread is unaudited). If one does, it
+   appears once and is remembered.
 7. Thumbnails, the time and filament lines in an Orca 2.5 G-code match the parser fixtures.
+8. The script's `skipped` / `success` message shows in the Plugins window after Run.
+9. What `outputName` a Bambu send carries: the staged file is the plate's temp G-code (`plate_1.gcode`), so the
+   print name may need the project name instead.
 
 ## Out of scope for v1
 
