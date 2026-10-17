@@ -8,6 +8,10 @@ import gzip
 import json
 import uuid
 
+# The API's caps (a 400 above them).
+MAX_MODELS = 1000
+MAX_USER_PRESETS = 64
+
 
 def metadata(*, plugin_version, slicer_version, output_name, host, template, bounds, user_presets):
     return {
@@ -26,11 +30,11 @@ def metadata(*, plugin_version, slicer_version, output_name, host, template, bou
                 "maxY": box.max_y,
                 "maxZ": box.max_z,
             }
-            for box in bounds
+            for box in bounds[:MAX_MODELS]
         ],
         "userPresets": [
             {"kind": preset.kind, "name": preset.name, "json": preset.json}
-            for preset in user_presets
+            for preset in user_presets[:MAX_USER_PRESETS]
         ],
     }
 

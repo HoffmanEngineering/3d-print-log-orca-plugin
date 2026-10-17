@@ -96,3 +96,15 @@ def test_the_boundary_never_appears_in_the_content():
     boundary = content_type.split("boundary=")[1].encode()
 
     assert body.count(boundary) == 3  # two part delimiters and the closing one
+
+
+def test_metadata_caps_models_and_presets_at_the_api_limits():
+    # The API answers 400 above 1,000 models or 64 presets; the library only reads the first
+    # 1,000 models anyway.
+    bounds = [ObjectBounds(f"m{i}", 0, 1, 0, 1, 1, has_points=True) for i in range(1001)]
+    presets = [UserPreset("filament", f"f{i}", "{}") for i in range(65)]
+    fields = make_metadata(bounds=bounds, user_presets=presets)
+    assert len(fields["models"]) == payload.MAX_MODELS == 1000
+    assert len(fields["userPresets"]) == payload.MAX_USER_PRESETS == 64
+    assert fields["models"][0]["name"] == "m0"
+    assert fields["userPresets"][0]["name"] == "f0"

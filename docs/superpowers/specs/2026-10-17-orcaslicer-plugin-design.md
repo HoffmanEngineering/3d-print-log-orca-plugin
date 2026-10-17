@@ -166,10 +166,14 @@ Responses:
 | Status | When |
 |---|---|
 | 200 `{ "newSettingId": "<guid>" }` | Stored. Same DTO as `/api/Cura/settings`. |
-| 400 | Missing part, bad JSON, bad gzip, unknown `template`. |
-| 413 | Request over 8 MB, decompressed text over 4,000,001 chars, or `metadata` over 1 MB. |
+| 400 | Missing, duplicate or malformed part; bad JSON or gzip; empty G-code text; missing `pluginVersion` or `template`; unknown `template`; a model missing a field; a preset `kind` other than `process`/`filament`/`machine`; over 1,000 models, 64 presets or a 256-character preset name. |
+| 413 | Request over 8 MiB, decompressed text over 4,000,001 chars, or `metadata` over 1 MiB. |
 | 415 | Not multipart. |
-| 429 | Rate limit: 10 per minute and 200 per day per IP, with `Retry-After`. |
+| 429 | Rate limit: 10 per minute and 200 per day per client address (IPv6 per /64), with `Retry-After`. Settings `Slicer:UploadRateLimitPerMinute` / `PerDay`. |
+
+A preset whose `json` is not a JSON object is dropped, not rejected. `CuraVersion` falls back to `slicerVersion` when
+the header has no version. Preset values are blanked, not removed, so presets and scrubbed text agree. The plugin caps
+what it sends at 1,000 models and 64 presets. (Built in 3d-print-log-api#261.)
 
 The new-print URL stays `{web_base}/prints/new/cura?cura_version=<slicerVersion>&plugin_version=<pluginVersion>&settingId=<id>`,
 so the web UI needs no change.
